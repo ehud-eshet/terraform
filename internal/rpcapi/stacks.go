@@ -1,16 +1,20 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package rpcapi
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-slug/sourceaddrs"
 	"github.com/hashicorp/go-slug/sourcebundle"
+	"github.com/hashicorp/terraform-svchost/disco"
 	"go.opentelemetry.io/otel/attribute"
 	otelCodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -18,17 +22,23 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/providercache"
 	"github.com/hashicorp/terraform/internal/providers"
+	"github.com/hashicorp/terraform/internal/rpcapi/terraform1"
 	"github.com/hashicorp/terraform/internal/rpcapi/terraform1/stacks"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
+	"github.com/hashicorp/terraform/internal/stacks/stackmigrate"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/stacks/stackruntime"
 	"github.com/hashicorp/terraform/internal/stacks/stackruntime/hooks"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
+	"github.com/hashicorp/terraform/internal/states"
+	"github.com/hashicorp/terraform/internal/states/statefile"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -36,6 +46,7 @@ type stacksServer struct {
 	stacks.UnimplementedStacksServer
 
 	stopper            *stopper
+	services           *disco.Disco
 	handles            *handleTable
 	experimentsAllowed bool
 
@@ -51,13 +62,20 @@ type stacksServer struct {
 	// for testing. This just ensures our tests aren't flaky as we can use a
 	// constant timestamp for the plan.
 	planTimestampOverride *time.Time
+	// policyClientOverride is an in-memory override of the policy client used for testing.
+	policyClientOverride policy.Client
 }
 
-var _ stacks.StacksServer = (*stacksServer)(nil)
+var (
+	_ stacks.StacksServer = (*stacksServer)(nil)
 
-func newStacksServer(stopper *stopper, handles *handleTable, opts *serviceOpts) *stacksServer {
+	WorkspaceNameEnvVar = "TF_WORKSPACE"
+)
+
+func newStacksServer(stopper *stopper, handles *handleTable, services *disco.Disco, opts *serviceOpts) *stacksServer {
 	return &stacksServer{
 		stopper:            stopper,
+		services:           services,
 		handles:            handles,
 		experimentsAllowed: opts.experimentsAllowed,
 	}
@@ -227,19 +245,45 @@ func stackConfigMetaforProto(cfgNode *stackconfig.ConfigNode, stackAddr stackadd
 	}
 
 	// Currently Components are the only thing that can be removed
-	for name, rc := range cfgNode.Stack.Removed {
-		cProto := &stacks.FindStackConfigurationComponents_Removed{
-			SourceAddr:    rc.FinalSourceAddr.String(),
-			ComponentAddr: stackaddrs.Config(stackAddr, stackaddrs.Component{Name: rc.FromComponent.Name}).String(),
-			Destroy:       rc.Destroy,
+	for name, rc := range cfgNode.Stack.RemovedComponents.All() {
+		var blocks []*stacks.FindStackConfigurationComponents_Removed_Block
+		for _, rc := range rc {
+			relativeAddress := rc.From.TargetConfigComponent()
+			cProto := &stacks.FindStackConfigurationComponents_Removed_Block{
+				SourceAddr:    rc.FinalSourceAddr.String(),
+				ComponentAddr: stackaddrs.Config(append(stackAddr, relativeAddress.Stack...), relativeAddress.Item).String(),
+				Destroy:       rc.Destroy,
+			}
+			switch {
+			case rc.ForEach != nil:
+				cProto.Instances = stacks.FindStackConfigurationComponents_FOR_EACH
+			default:
+				cProto.Instances = stacks.FindStackConfigurationComponents_SINGLE
+			}
+			blocks = append(blocks, cProto)
 		}
-		switch {
-		case rc.ForEach != nil:
-			cProto.Instances = stacks.FindStackConfigurationComponents_FOR_EACH
-		default:
-			cProto.Instances = stacks.FindStackConfigurationComponents_SINGLE
+		relativeAddress := rc[0].From.TargetConfigComponent()
+		ret.Removed[name.String()] = &stacks.FindStackConfigurationComponents_Removed{
+			// in order to ensure as much backwards and forwards compatibility
+			// as possible, we're going to set the deprecated single fields
+			// with the first run block
+
+			SourceAddr: rc[0].FinalSourceAddr.String(),
+			Instances: func() stacks.FindStackConfigurationComponents_Instances {
+				switch {
+				case rc[0].ForEach != nil:
+					return stacks.FindStackConfigurationComponents_FOR_EACH
+				default:
+					return stacks.FindStackConfigurationComponents_SINGLE
+				}
+			}(),
+			ComponentAddr: stackaddrs.Config(append(stackAddr, relativeAddress.Stack...), relativeAddress.Item).String(),
+			Destroy:       rc[0].Destroy,
+
+			// We return all the values here:
+
+			Blocks: blocks,
 		}
-		ret.Removed[name] = cProto
 	}
 
 	return ret
@@ -279,6 +323,44 @@ func (s *stacksServer) PlanStackChanges(req *stacks.PlanStackChanges_Request, ev
 	ctx := evts.Context()
 	syncEvts := newSyncStreamingRPCSender(evts)
 	evts = nil // Prevent accidental unsynchronized usage of this server
+
+	// Setup the policy client if the caller provides a plugin path and policies
+	var policyClient policy.Client
+	if req.TfpolicyPluginPath != nil && len(req.PolicyPaths) > 0 {
+		if s.policyClientOverride != nil {
+			// Tests use a mock policy client
+			policyClient = s.policyClientOverride
+		} else {
+			var entitlement *policy.Entitlement
+			if req.PolicyEntitlement != nil {
+				entitlement = &policy.Entitlement{
+					Host:  req.PolicyEntitlement.Host,
+					Token: req.PolicyEntitlement.Token,
+					Org:   req.PolicyEntitlement.Org,
+				}
+			}
+			// Normal code path for connecting to a policy client
+			var diags policy.Diagnostics
+			policyClient, diags = policy.NewPolicyClient(ctx, *req.TfpolicyPluginPath, req.PolicyPaths, entitlement)
+			if diags.HasErrors() {
+				// Send the policy diagnostics back to the client
+				syncEvts.Send(&stacks.PlanStackChanges_Event{
+					Event: &stacks.PlanStackChanges_Event_PolicySetupDiagnostics{
+						PolicySetupDiagnostics: &stacks.PolicySetupDiagnostics{
+							// There is no target address here, since the diagnostics are at the top-level
+							Diagnostics: policyDiagsToProto("", diags),
+						},
+					},
+				})
+
+				// Still allow the plan to run, which lets tfc-agent determine what to do with the policy diagnostics
+				policyClient = nil
+			} else {
+				log.Printf("[DEBUG] rpcapi: Policy engine initialized with paths: %v", req.PolicyPaths)
+				defer policyClient.Stop()
+			}
+		}
+	}
 
 	cfgHnd := handle[*stackconfig.Config](req.StackConfigHandle)
 	cfg := s.handles.StackConfig(cfgHnd)
@@ -335,8 +417,21 @@ func (s *stacksServer) PlanStackChanges(req *stacks.PlanStackChanges_Request, ev
 	// We'll hook some internal events in the planning process both to generate
 	// tracing information if we're in an OpenTelemetry-aware context and
 	// to propagate a subset of the events to our client.
-	hooks := stackPlanHooks(syncEvts, cfg.Root.Stack.SourceAddr)
-	ctx = stackruntime.ContextWithHooks(ctx, hooks)
+	planHooks := stackPlanHooks(syncEvts, cfg.Root.Stack.SourceAddr)
+	ctx = stackruntime.ContextWithHooks(ctx, planHooks)
+
+	// We collect policy evaluation results from individual resource events
+	// during the planning process and then send them at once to the stacks client.
+	policyResults := stackPolicyEvaluationHooks(policyClient, planHooks)
+	sendPolicyResults := sync.OnceFunc(func() {
+		for addr, results := range policyResults.All() {
+			syncEvts.Send(&stacks.PlanStackChanges_Event{
+				Event: &stacks.PlanStackChanges_Event_ComponentInstancePolicyEvaluation{
+					ComponentInstancePolicyEvaluation: componentInstancePolicyEvaluationProto(addr, results),
+				},
+			})
+		}
+	})
 
 	var planMode plans.Mode
 	switch req.PlanMode {
@@ -376,6 +471,7 @@ func (s *stacksServer) PlanStackChanges(req *stacks.PlanStackChanges_Request, ev
 		InputValues:        inputValues,
 		ExperimentsAllowed: s.experimentsAllowed,
 		DependencyLocks:    *deps,
+		PolicyClient:       policyClient,
 
 		// planTimestampOverride will be null if not set, so it's fine for
 		// us to just set this all the time. In practice, this will only have
@@ -401,7 +497,12 @@ func (s *stacksServer) PlanStackChanges(req *stacks.PlanStackChanges_Request, ev
 	// The actual plan operation runs in the background, and emits events
 	// to us via the channels in rtResp before finally closing changesCh
 	// to signal that the process is complete.
-	go stackruntime.Plan(planCtx, &rtReq, &rtResp)
+	go func() {
+		stackruntime.Plan(planCtx, &rtReq, &rtResp)
+
+		// Send policy evaluation results to the client after the plan completes.
+		sendPolicyResults()
+	}()
 
 	emitDiag := func(diag tfdiags.Diagnostic) {
 		diags := tfdiags.Diagnostics{diag}
@@ -437,6 +538,10 @@ Events:
 						emitDiag(diag)
 					}
 				}
+
+				// If the changes channel is closed before we finish, we still
+				// need to send any policy results so far to the client.
+				sendPolicyResults()
 				break Events
 			}
 
@@ -557,7 +662,9 @@ func (s *stacksServer) ApplyStackChanges(req *stacks.ApplyStackChanges_Request, 
 	}
 	depsHnd := handle[*depsfile.Locks](req.DependencyLocksHandle)
 	var deps *depsfile.Locks
-	if !depsHnd.IsNil() {
+	if s.providerDependencyLockOverride != nil {
+		deps = s.providerDependencyLockOverride
+	} else if !depsHnd.IsNil() {
 		deps = s.handles.DependencyLocks(depsHnd)
 		if deps == nil {
 			return status.Error(codes.InvalidArgument, "the given dependency locks handle is invalid")
@@ -573,14 +680,61 @@ func (s *stacksServer) ApplyStackChanges(req *stacks.ApplyStackChanges_Request, 
 			return status.Error(codes.InvalidArgument, "the given provider cache handle is invalid")
 		}
 	}
-	// NOTE: providerCache can be nil if no handle was provided, in which
-	// case the call can only use built-in providers. All code below
-	// must avoid panicking when providerCache is nil, but is allowed to
-	// return an InvalidArgument error in that case.
-	// (providerFactoriesForLocks explicitly supports a nil providerCache)
-	providerFactories, err := providerFactoriesForLocks(deps, providerCache)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "provider dependencies are inconsistent: %s", err)
+	var providerFactories map[addrs.Provider]providers.Factory
+	if s.providerCacheOverride != nil {
+		// This is only used in tests to side load providers without needing a
+		// real provider cache.
+		providerFactories = s.providerCacheOverride
+	} else {
+		// NOTE: providerCache can be nil if no handle was provided, in which
+		// case the call can only use built-in providers. All code below
+		// must avoid panicking when providerCache is nil, but is allowed to
+		// return an InvalidArgument error in that case.
+		// (providerFactoriesForLocks explicitly supports a nil providerCache)
+		var err error
+		// (providerFactoriesForLocks explicitly supports a nil providerCache)
+		providerFactories, err = providerFactoriesForLocks(deps, providerCache)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "provider dependencies are inconsistent: %s", err)
+		}
+	}
+
+	// Setup the policy client if the caller provides a plugin path and policies
+	var policyClient policy.Client
+	if req.TfpolicyPluginPath != nil && len(req.PolicyPaths) > 0 {
+		if s.policyClientOverride != nil {
+			// Tests use a mock policy client
+			policyClient = s.policyClientOverride
+		} else {
+			var entitlement *policy.Entitlement
+			if req.PolicyEntitlement != nil {
+				entitlement = &policy.Entitlement{
+					Host:  req.PolicyEntitlement.Host,
+					Token: req.PolicyEntitlement.Token,
+					Org:   req.PolicyEntitlement.Org,
+				}
+			}
+			// Normal code path for connecting to a policy client
+			var diags policy.Diagnostics
+			policyClient, diags = policy.NewPolicyClient(ctx, *req.TfpolicyPluginPath, req.PolicyPaths, entitlement)
+			if diags.HasErrors() {
+				// Send the policy diagnostics back to the client
+				syncEvts.Send(&stacks.ApplyStackChanges_Event{
+					Event: &stacks.ApplyStackChanges_Event_PolicySetupDiagnostics{
+						PolicySetupDiagnostics: &stacks.PolicySetupDiagnostics{
+							// There is no target address here, since the diagnostics are at the top-level
+							Diagnostics: policyDiagsToProto("", diags),
+						},
+					},
+				})
+
+				// Still allow the apply to run, which lets tfc-agent determine what to do with the policy diagnostics
+				policyClient = nil
+			} else {
+				log.Printf("[DEBUG] rpcapi: Policy engine initialized with paths: %v", req.PolicyPaths)
+				defer policyClient.Stop()
+			}
+		}
 	}
 
 	inputValues, err := externalInputValuesFromProto(req.InputValues)
@@ -591,9 +745,21 @@ func (s *stacksServer) ApplyStackChanges(req *stacks.ApplyStackChanges_Request, 
 	// We'll hook some internal events in the planning process both to generate
 	// tracing information if we're in an OpenTelemetry-aware context and
 	// to propagate a subset of the events to our client.
-	hooks := stackApplyHooks(syncEvts, cfg.Root.Stack.SourceAddr)
-	ctx = stackruntime.ContextWithHooks(ctx, hooks)
+	applyHooks := stackApplyHooks(syncEvts, cfg.Root.Stack.SourceAddr)
+	ctx = stackruntime.ContextWithHooks(ctx, applyHooks)
 
+	// We collect policy evaluation results from individual resource events
+	// during the apply process and then send them at once to the stacks client.
+	policyResults := stackPolicyEvaluationHooks(policyClient, applyHooks)
+	sendPolicyResults := sync.OnceFunc(func() {
+		for addr, results := range policyResults.All() {
+			syncEvts.Send(&stacks.ApplyStackChanges_Event{
+				Event: &stacks.ApplyStackChanges_Event_ComponentInstancePolicyEvaluation{
+					ComponentInstancePolicyEvaluation: componentInstancePolicyEvaluationProto(addr, results),
+				},
+			})
+		}
+	})
 	changesCh := make(chan stackstate.AppliedChange, 8)
 	diagsCh := make(chan tfdiags.Diagnostic, 2)
 	rtReq := stackruntime.ApplyRequest{
@@ -603,6 +769,7 @@ func (s *stacksServer) ApplyStackChanges(req *stacks.ApplyStackChanges_Request, 
 		Plan:               plan,
 		ExperimentsAllowed: s.experimentsAllowed,
 		DependencyLocks:    *deps,
+		PolicyClient:       policyClient,
 	}
 	rtResp := stackruntime.ApplyResponse{
 		AppliedChanges: changesCh,
@@ -623,7 +790,12 @@ func (s *stacksServer) ApplyStackChanges(req *stacks.ApplyStackChanges_Request, 
 	// The actual apply operation runs in the background, and emits events
 	// to us via the channels in rtResp before finally closing changesCh
 	// to signal that the process is complete.
-	go stackruntime.Apply(applyCtx, &rtReq, &rtResp)
+	go func() {
+		stackruntime.Apply(applyCtx, &rtReq, &rtResp)
+
+		// Send policy evaluation results to the client after the apply completes.
+		sendPolicyResults()
+	}()
 
 	emitDiag := func(diag tfdiags.Diagnostic) {
 		diags := tfdiags.Diagnostics{diag}
@@ -659,6 +831,10 @@ Events:
 						emitDiag(diag)
 					}
 				}
+
+				// If the changes channel is closed before we finish, we still
+				// need to send any policy results so far to the client.
+				sendPolicyResults()
 				break Events
 			}
 
@@ -767,6 +943,66 @@ func (s *stacksServer) OpenStackInspector(ctx context.Context, req *stacks.OpenS
 	}, nil
 }
 
+func (s *stacksServer) ListResourceIdentities(ctx context.Context, req *stacks.ListResourceIdentities_Request) (*stacks.ListResourceIdentities_Response, error) {
+	hnd := handle[*stackstate.State](req.StateHandle)
+	stackState := s.handles.StackState(hnd)
+	if stackState == nil {
+		return nil, status.Error(codes.InvalidArgument, "the given stack state handle is invalid")
+	}
+
+	depsHnd := handle[*depsfile.Locks](req.DependencyLocksHandle)
+	var deps *depsfile.Locks
+	if !depsHnd.IsNil() {
+		deps = s.handles.DependencyLocks(depsHnd)
+		if deps == nil {
+			return nil, status.Error(codes.InvalidArgument, "the given dependency locks handle is invalid")
+		}
+	} else {
+		deps = depsfile.NewLocks()
+	}
+	providerCacheHnd := handle[*providercache.Dir](req.ProviderCacheHandle)
+	var providerCache *providercache.Dir
+	if !providerCacheHnd.IsNil() {
+		providerCache = s.handles.ProviderPluginCache(providerCacheHnd)
+		if providerCache == nil {
+			return nil, status.Error(codes.InvalidArgument, "the given provider cache handle is invalid")
+		}
+	}
+	// NOTE: providerCache can be nil if no handle was provided, in which
+	// case the call can only use built-in providers. All code below
+	// must avoid panicking when providerCache is nil, but is allowed to
+	// return an InvalidArgument error in that case.
+	// (providerFactoriesForLocks explicitly supports a nil providerCache)
+	providerFactories, err := providerFactoriesForLocks(deps, providerCache)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "provider dependencies are inconsistent: %s", err)
+	}
+
+	identitySchemas := make(map[addrs.Provider]map[string]providers.IdentitySchema)
+	for name, factory := range providerFactories {
+		provider, err := factory()
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "provider %s failed to initialize: %s", name, err)
+		}
+
+		schema := provider.GetResourceIdentitySchemas()
+		if len(schema.Diagnostics) > 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "provider %s failed to retrieve schema: %s", name, schema.Diagnostics.Err())
+		} else {
+			identitySchemas[name] = schema.IdentityTypes
+		}
+	}
+
+	resourceIdentities, err := listResourceIdentities(stackState, identitySchemas)
+	if err != nil {
+		return nil, err
+	}
+
+	return &stacks.ListResourceIdentities_Response{
+		Resource: resourceIdentities,
+	}, nil
+}
+
 func (s *stacksServer) InspectExpressionResult(ctx context.Context, req *stacks.InspectExpressionResult_Request) (*stacks.InspectExpressionResult_Response, error) {
 	hnd := handle[*stacksInspector](req.StackInspectorHandle)
 	insp := s.handles.StackInspector(hnd)
@@ -776,8 +1012,141 @@ func (s *stacksServer) InspectExpressionResult(ctx context.Context, req *stacks.
 	return insp.InspectExpressionResult(ctx, req)
 }
 
+func (s *stacksServer) OpenTerraformState(ctx context.Context, request *stacks.OpenTerraformState_Request) (*stacks.OpenTerraformState_Response, error) {
+	switch data := request.State.(type) {
+	case *stacks.OpenTerraformState_Request_ConfigPath:
+		// Load the state from the backend.
+		// This function should return an empty state even if the diags
+		// has errors. This makes it easier for the caller, as they should
+		// close the state handle regardless of the diags.
+		loader := stackmigrate.Loader{Discovery: s.services}
+		state, diags := loader.LoadState(data.ConfigPath)
+
+		hnd := s.handles.NewTerraformState(state)
+		return &stacks.OpenTerraformState_Response{
+			StateHandle: hnd.ForProtobuf(),
+			Diagnostics: diagnosticsToProto(diags),
+		}, nil
+
+	case *stacks.OpenTerraformState_Request_Raw:
+		// load the state from the raw data
+		file, err := statefile.Read(bytes.NewReader(data.Raw))
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid raw state data: %s", err)
+		}
+
+		hnd := s.handles.NewTerraformState(file.State)
+		return &stacks.OpenTerraformState_Response{
+			StateHandle: hnd.ForProtobuf(),
+		}, nil
+
+	default:
+		return nil, status.Error(codes.InvalidArgument, "invalid state source")
+	}
+}
+
+func (s *stacksServer) CloseTerraformState(ctx context.Context, request *stacks.CloseTerraformState_Request) (*stacks.CloseTerraformState_Response, error) {
+	hnd := handle[*states.State](request.StateHandle)
+	err := s.handles.CloseTerraformState(hnd)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	return new(stacks.CloseTerraformState_Response), nil
+}
+
+func (s *stacksServer) MigrateTerraformState(request *stacks.MigrateTerraformState_Request, server stacks.Stacks_MigrateTerraformStateServer) error {
+	previousStateHandle := handle[*states.State](request.StateHandle)
+	previousState := s.handles.TerraformState(previousStateHandle)
+	if previousState == nil {
+		return status.Error(codes.InvalidArgument, "the given state handle is invalid")
+	}
+
+	configHandle := handle[*stackconfig.Config](request.ConfigHandle)
+	config := s.handles.StackConfig(configHandle)
+	if config == nil {
+		return status.Error(codes.InvalidArgument, "the given config handle is invalid")
+	}
+
+	dependencyLocksHandle := handle[*depsfile.Locks](request.DependencyLocksHandle)
+	dependencyLocks := s.handles.DependencyLocks(dependencyLocksHandle)
+	if dependencyLocks == nil {
+		return status.Error(codes.InvalidArgument, "the given dependency locks handle is invalid")
+	}
+
+	var providerFactories map[addrs.Provider]providers.Factory
+	if s.providerCacheOverride != nil {
+		// This is only used in tests to side load providers without needing a
+		// real provider cache.
+		providerFactories = s.providerCacheOverride
+	} else {
+		providerCacheHandle := handle[*providercache.Dir](request.ProviderCacheHandle)
+		providerCache := s.handles.ProviderPluginCache(providerCacheHandle)
+		if providerCache == nil {
+			return status.Error(codes.InvalidArgument, "the given provider cache handle is invalid")
+		}
+
+		var err error
+		providerFactories, err = providerFactoriesForLocks(dependencyLocks, providerCache)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "provider dependencies are inconsistent: %s", err)
+		}
+	}
+
+	migrate := &stackmigrate.Migration{
+		Providers:     providerFactories,
+		PreviousState: previousState,
+		Config:        config,
+	}
+
+	emit := func(change stackstate.AppliedChange) {
+		proto, err := change.AppliedChangeProto()
+		if err != nil {
+			server.Send(&stacks.MigrateTerraformState_Event{
+				Result: &stacks.MigrateTerraformState_Event_Diagnostic{
+					Diagnostic: &terraform1.Diagnostic{
+						Severity: terraform1.Diagnostic_ERROR,
+						Summary:  "Failed to serialize change",
+						Detail:   fmt.Sprintf("Failed to serialize state change for recording in the migration plan: %s", err),
+					},
+				},
+			})
+			return
+		}
+
+		server.Send(&stacks.MigrateTerraformState_Event{
+			Result: &stacks.MigrateTerraformState_Event_AppliedChange{
+				AppliedChange: proto,
+			},
+		})
+	}
+
+	emitDiag := func(diagnostic tfdiags.Diagnostic) {
+		server.Send(&stacks.MigrateTerraformState_Event{
+			Result: &stacks.MigrateTerraformState_Event_Diagnostic{
+				Diagnostic: diagnosticToProto(diagnostic),
+			},
+		})
+	}
+
+	mapping := request.GetMapping()
+	if mapping == nil {
+		return status.Error(codes.InvalidArgument, "missing migration mapping")
+	}
+	switch mapping := mapping.(type) {
+	case *stacks.MigrateTerraformState_Request_Simple:
+		migrate.Migrate(
+			mapping.Simple.ResourceAddressMap,
+			mapping.Simple.ModuleAddressMap,
+			emit, emitDiag)
+	default:
+		return status.Error(codes.InvalidArgument, "unsupported migration mapping")
+	}
+
+	return nil
+}
+
 func stackPlanHooks(evts *syncPlanStackChangesServer, mainStackSource sourceaddrs.FinalSource) *stackruntime.Hooks {
-	return stackChangeHooks(
+	changeHooks := stackChangeHooks(
 		func(scp *stacks.StackChangeProgress) error {
 			return evts.Send(&stacks.PlanStackChanges_Event{
 				Event: &stacks.PlanStackChanges_Event_Progress{
@@ -787,10 +1156,23 @@ func stackPlanHooks(evts *syncPlanStackChangesServer, mainStackSource sourceaddr
 		},
 		mainStackSource,
 	)
+
+	changeHooks.ReportProviderInstancePolicyResult = func(ctx context.Context, h *hooks.ProviderInstancePolicyResults) {
+		if h.Result.Empty() {
+			return
+		}
+		evts.Send(&stacks.PlanStackChanges_Event{
+			Event: &stacks.PlanStackChanges_Event_ProviderInstancePolicyEvaluation{
+				ProviderInstancePolicyEvaluation: providerInstancePolicyEvaluationProto(h),
+			},
+		})
+	}
+
+	return changeHooks
 }
 
 func stackApplyHooks(evts *syncApplyStackChangesServer, mainStackSource sourceaddrs.FinalSource) *stackruntime.Hooks {
-	return stackChangeHooks(
+	changeHooks := stackChangeHooks(
 		func(scp *stacks.StackChangeProgress) error {
 			return evts.Send(&stacks.ApplyStackChanges_Event{
 				Event: &stacks.ApplyStackChanges_Event_Progress{
@@ -800,6 +1182,19 @@ func stackApplyHooks(evts *syncApplyStackChangesServer, mainStackSource sourcead
 		},
 		mainStackSource,
 	)
+
+	changeHooks.ReportProviderInstancePolicyResult = func(ctx context.Context, h *hooks.ProviderInstancePolicyResults) {
+		if h.Result.Empty() {
+			return
+		}
+		evts.Send(&stacks.ApplyStackChanges_Event{
+			Event: &stacks.ApplyStackChanges_Event_ProviderInstancePolicyEvaluation{
+				ProviderInstancePolicyEvaluation: providerInstancePolicyEvaluationProto(h),
+			},
+		})
+	}
+
+	return changeHooks
 }
 
 // stackChangeHooks is the shared hook-handling logic for both [stackPlanHooks]
@@ -964,6 +1359,86 @@ func stackChangeHooks(send func(*stacks.StackChangeProgress) error, mainStackSou
 			return span
 		},
 
+		ReportActionInvocationPlanned: func(ctx context.Context, span any, ai *hooks.ActionInvocation) any {
+			span.(trace.Span).AddEvent("planned action invocation", trace.WithAttributes(
+				attribute.String("component_instance", ai.Addr.Component.String()),
+				attribute.String("action_invocation_instance", ai.Addr.Item.String()),
+			))
+
+			inv, err := actionInvocationPlanned(ai)
+			if err != nil {
+				return span
+			}
+
+			send(&stacks.StackChangeProgress{
+				Event: &stacks.StackChangeProgress_ActionInvocationPlanned_{
+					ActionInvocationPlanned: inv,
+				},
+			})
+
+			return span
+		},
+
+		ReportActionInvocationStatus: func(ctx context.Context, span any, statusData *hooks.ActionInvocationStatusHookData) any {
+			span.(trace.Span).AddEvent("action invocation status", trace.WithAttributes(
+				attribute.String("component_instance", statusData.Addr.Component.String()),
+				attribute.String("action_invocation_instance", statusData.Addr.Item.String()),
+				attribute.String("status", statusData.Status.String()),
+			))
+
+			providerAddr := ""
+			if !statusData.ProviderAddr.IsZero() {
+				providerAddr = statusData.ProviderAddr.String()
+			}
+
+			protoStatus := &stacks.StackChangeProgress_ActionInvocationStatus{
+				Addr:         stacks.NewActionInvocationInStackAddr(statusData.Addr),
+				Status:       statusData.Status.ForProtobuf(),
+				ProviderAddr: providerAddr,
+			}
+
+			// Set the action trigger oneof
+			setActionInvocationStatusTrigger(protoStatus, statusData.Addr.Component, statusData.Trigger)
+
+			send(&stacks.StackChangeProgress{
+				Event: &stacks.StackChangeProgress_ActionInvocationStatus_{
+					ActionInvocationStatus: protoStatus,
+				},
+			})
+
+			return span
+		},
+
+		ReportActionInvocationProgress: func(ctx context.Context, span any, progressData *hooks.ActionInvocationProgressHookData) any {
+			span.(trace.Span).AddEvent("action invocation progress", trace.WithAttributes(
+				attribute.String("component_instance", progressData.Addr.Component.String()),
+				attribute.String("action_invocation_instance", progressData.Addr.Item.String()),
+				attribute.String("message", progressData.Message),
+			))
+
+			providerAddr := ""
+			if !progressData.ProviderAddr.IsZero() {
+				providerAddr = progressData.ProviderAddr.String()
+			}
+
+			protoProgress := &stacks.StackChangeProgress_ActionInvocationProgress{
+				Addr:         stacks.NewActionInvocationInStackAddr(progressData.Addr),
+				Message:      progressData.Message,
+				ProviderAddr: providerAddr,
+			}
+
+			// Set the action trigger oneof
+			setActionInvocationProgressTrigger(protoProgress, progressData.Addr.Component, progressData.Trigger)
+
+			send(&stacks.StackChangeProgress{
+				Event: &stacks.StackChangeProgress_ActionInvocationProgress_{
+					ActionInvocationProgress: protoProgress,
+				},
+			})
+
+			return span
+		},
+
 		ReportResourceInstanceDeferred: func(ctx context.Context, span any, change *hooks.DeferredResourceInstanceChange) any {
 			span.(trace.Span).AddEvent("deferred resource instance", trace.WithAttributes(
 				attribute.String("component_instance", change.Change.Addr.Component.String()),
@@ -998,14 +1473,15 @@ func stackChangeHooks(send func(*stacks.StackChangeProgress) error, mainStackSou
 							ComponentAddr:         stackaddrs.ConfigComponentForAbsInstance(cic.Addr).String(),
 							ComponentInstanceAddr: cic.Addr.String(),
 						},
-						Total:  int32(cic.Total()),
-						Add:    int32(cic.Add),
-						Change: int32(cic.Change),
-						Import: int32(cic.Import),
-						Remove: int32(cic.Remove),
-						Defer:  int32(cic.Defer),
-						Move:   int32(cic.Move),
-						Forget: int32(cic.Forget),
+						Total:            int32(cic.Total()),
+						Add:              int32(cic.Add),
+						Change:           int32(cic.Change),
+						Import:           int32(cic.Import),
+						Remove:           int32(cic.Remove),
+						Defer:            int32(cic.Defer),
+						Move:             int32(cic.Move),
+						Forget:           int32(cic.Forget),
+						ActionInvocation: int32(cic.ActionInvocation),
 					},
 				},
 			})
@@ -1025,20 +1501,46 @@ func stackChangeHooks(send func(*stacks.StackChangeProgress) error, mainStackSou
 							ComponentAddr:         stackaddrs.ConfigComponentForAbsInstance(cic.Addr).String(),
 							ComponentInstanceAddr: cic.Addr.String(),
 						},
-						Total:  int32(cic.Total()),
-						Add:    int32(cic.Add),
-						Change: int32(cic.Change),
-						Import: int32(cic.Import),
-						Remove: int32(cic.Remove),
-						Defer:  int32(cic.Defer),
-						Move:   int32(cic.Move),
-						Forget: int32(cic.Forget),
+						Total:            int32(cic.Total()),
+						Add:              int32(cic.Add),
+						Change:           int32(cic.Change),
+						Import:           int32(cic.Import),
+						Remove:           int32(cic.Remove),
+						Defer:            int32(cic.Defer),
+						Move:             int32(cic.Move),
+						Forget:           int32(cic.Forget),
+						ActionInvocation: int32(cic.ActionInvocation),
 					},
 				},
 			})
 			return span
 		},
 	}
+}
+
+// stackPolicyEvaluationHooks collects every policy result reported for a
+// component instance, grouped by resource address. A resource address can
+// report more than once: a replaced resource instance is evaluated separately
+// for its create and its delete, so results are accumulated rather than
+// overwritten.
+func stackPolicyEvaluationHooks(policyClient policy.Client, runtimeHooks *stackruntime.Hooks) collections.Map[stackaddrs.AbsComponentInstance, map[string][]policy.EvaluationResponse] {
+	resultMap := collections.NewMap[stackaddrs.AbsComponentInstance, map[string][]policy.EvaluationResponse]()
+	if policyClient != nil {
+		mu := sync.Mutex{}
+		runtimeHooks.ReportComponentInstancePolicyResult = func(ctx context.Context, a any, h *hooks.ComponentInstancePolicyResult) any {
+			mu.Lock()
+			defer mu.Unlock()
+			mp, ok := resultMap.GetOk(h.ComponentAddr)
+			if !ok {
+				mp = make(map[string][]policy.EvaluationResponse)
+				resultMap.Put(h.ComponentAddr, mp)
+			}
+			mp[h.ResourceAddr] = append(mp[h.ResourceAddr], h.Result)
+			return nil
+		}
+	}
+
+	return resultMap
 }
 
 func resourceInstancePlanned(ric *hooks.ResourceInstanceChange) (*stacks.StackChangeProgress_ResourceInstancePlannedChange, error) {
@@ -1072,6 +1574,89 @@ func resourceInstancePlanned(ric *hooks.ResourceInstanceChange) (*stacks.StackCh
 		Imported:     imported,
 		ProviderAddr: ric.Change.ProviderAddr.Provider.String(),
 	}, nil
+}
+
+func actionInvocationPlanned(ai *hooks.ActionInvocation) (*stacks.StackChangeProgress_ActionInvocationPlanned, error) {
+	res := &stacks.StackChangeProgress_ActionInvocationPlanned{
+		Addr:         stacks.NewActionInvocationInStackAddr(ai.Addr),
+		ProviderAddr: ai.ProviderAddr.String(),
+	}
+
+	setActionInvocationPlannedTrigger(res, ai.Addr.Component, ai.Trigger)
+
+	return res, nil
+}
+
+// setActionInvocationStatusTrigger sets the ActionTrigger oneof field on an ActionInvocationStatus message.
+func setActionInvocationStatusTrigger(msg *stacks.StackChangeProgress_ActionInvocationStatus, component stackaddrs.AbsComponentInstance, trigger plans.ActionTrigger) {
+	switch trig := trigger.(type) {
+	case *plans.ResourceActionTrigger:
+		msg.ActionTrigger = &stacks.StackChangeProgress_ActionInvocationStatus_ResourceActionTrigger{
+			ResourceActionTrigger: &stacks.StackChangeProgress_ResourceActionTrigger{
+				TriggeringResourceAddress: stacks.NewResourceInstanceInStackAddr(
+					stackaddrs.AbsResourceInstance{
+						Component: component,
+						Item:      trig.TriggeringResourceAddr,
+					},
+				),
+				TriggerEvent:            stacks.StackChangeProgress_ActionTriggerEvent(trig.TriggerEvent()),
+				ActionTriggerBlockIndex: int64(trig.ActionTriggerBlockIndex),
+				ActionsListIndex:        int64(trig.ActionsListIndex),
+			},
+		}
+	case *plans.InvokeActionTrigger:
+		msg.ActionTrigger = &stacks.StackChangeProgress_ActionInvocationStatus_InvokeActionTrigger{
+			InvokeActionTrigger: &stacks.StackChangeProgress_InvokeActionTrigger{},
+		}
+	}
+}
+
+// setActionInvocationProgressTrigger sets the ActionTrigger oneof field on an ActionInvocationProgress message.
+func setActionInvocationProgressTrigger(msg *stacks.StackChangeProgress_ActionInvocationProgress, component stackaddrs.AbsComponentInstance, trigger plans.ActionTrigger) {
+	switch trig := trigger.(type) {
+	case *plans.ResourceActionTrigger:
+		msg.ActionTrigger = &stacks.StackChangeProgress_ActionInvocationProgress_ResourceActionTrigger{
+			ResourceActionTrigger: &stacks.StackChangeProgress_ResourceActionTrigger{
+				TriggeringResourceAddress: stacks.NewResourceInstanceInStackAddr(
+					stackaddrs.AbsResourceInstance{
+						Component: component,
+						Item:      trig.TriggeringResourceAddr,
+					},
+				),
+				TriggerEvent:            stacks.StackChangeProgress_ActionTriggerEvent(trig.TriggerEvent()),
+				ActionTriggerBlockIndex: int64(trig.ActionTriggerBlockIndex),
+				ActionsListIndex:        int64(trig.ActionsListIndex),
+			},
+		}
+	case *plans.InvokeActionTrigger:
+		msg.ActionTrigger = &stacks.StackChangeProgress_ActionInvocationProgress_InvokeActionTrigger{
+			InvokeActionTrigger: &stacks.StackChangeProgress_InvokeActionTrigger{},
+		}
+	}
+}
+
+// setActionInvocationPlannedTrigger sets the ActionTrigger oneof field on an ActionInvocationPlanned message.
+func setActionInvocationPlannedTrigger(msg *stacks.StackChangeProgress_ActionInvocationPlanned, component stackaddrs.AbsComponentInstance, trigger plans.ActionTrigger) {
+	switch trig := trigger.(type) {
+	case *plans.ResourceActionTrigger:
+		msg.ActionTrigger = &stacks.StackChangeProgress_ActionInvocationPlanned_ResourceActionTrigger{
+			ResourceActionTrigger: &stacks.StackChangeProgress_ResourceActionTrigger{
+				TriggeringResourceAddress: stacks.NewResourceInstanceInStackAddr(
+					stackaddrs.AbsResourceInstance{
+						Component: component,
+						Item:      trig.TriggeringResourceAddr,
+					},
+				),
+				TriggerEvent:            stacks.StackChangeProgress_ActionTriggerEvent(trig.TriggerEvent()),
+				ActionTriggerBlockIndex: int64(trig.ActionTriggerBlockIndex),
+				ActionsListIndex:        int64(trig.ActionsListIndex),
+			},
+		}
+	case *plans.InvokeActionTrigger:
+		msg.ActionTrigger = &stacks.StackChangeProgress_ActionInvocationPlanned_InvokeActionTrigger{
+			InvokeActionTrigger: &stacks.StackChangeProgress_InvokeActionTrigger{},
+		}
+	}
 }
 
 func evtComponentInstanceStatus(ci stackaddrs.AbsComponentInstance, status hooks.ComponentInstanceStatus) *stacks.StackChangeProgress {

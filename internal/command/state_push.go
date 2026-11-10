@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/hashicorp/cli"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/clistate"
 	"github.com/hashicorp/terraform/internal/command/views"
@@ -19,42 +18,75 @@ import (
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
-// StatePushCommand is a Command implementation that shows a single resource.
+// StatePushCommand is a Command implementation that allows
+// pushing a local state to a remote location.
 type StatePushCommand struct {
 	Meta
 	StateMeta
 }
 
-func (c *StatePushCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	var flagForce bool
-	cmdFlags := c.Meta.ignoreRemoteVersionFlagSet("state push")
-	cmdFlags.BoolVar(&flagForce, "force", false, "")
-	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
-	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
+func (c *StatePushCommand) Run(rawArgs []string) int {
+	var diags tfdiags.Diagnostics
+
+	// Parse and apply global view arguments
+	common, rawArgs := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
+
+	// Process command-specific arguments.
+	parsedArgs, parseDiags := arguments.ParseStatePush(rawArgs)
+	diags = diags.Append(parseDiags)
+
+	// Prepare the view
+	view := views.NewStatePush(parsedArgs.ViewType, c.View)
+
+	// Now the view is ready, process any error diagnostics from parsing arguments.
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
-	args = cmdFlags.Args()
 
-	if len(args) != 1 {
-		c.Ui.Error("Exactly one argument expected.\n")
-		return cli.RunResultHelp
+	c.Meta.stateLock = parsedArgs.StateLock
+	c.Meta.stateLockTimeout = parsedArgs.StateLockTimeout
+	c.Meta.ignoreRemoteVersion = parsedArgs.IgnoreRemoteVersion
+
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(err)
+		view.Diagnostics(diags)
+		return 1
 	}
 
-	if diags := c.Meta.checkRequiredVersion(); diags != nil {
-		c.showDiagnostics(diags)
+	var varDiags tfdiags.Diagnostics
+	c.VariableValues, varDiags = parsedArgs.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	diags = diags.Append(varDiags)
+	if varDiags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	vDiags := c.Meta.checkRequiredVersion()
+	diags = diags.Append(vDiags)
+	if vDiags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Determine our reader for the input state. This is the filepath
 	// or stdin if "-" is given.
 	var r io.Reader = os.Stdin
-	if args[0] != "-" {
-		f, err := os.Open(args[0])
+	if parsedArgs.Path != "-" {
+		f, err := os.Open(parsedArgs.Path)
 		if err != nil {
-			c.Ui.Error(err.Error())
+			diags = diags.Append(
+				tfdiags.Sourceless(
+					tfdiags.Error,
+					"Failed to open state",
+					fmt.Sprintf("Error opening state %q: %s", parsedArgs.Path, err),
+				),
+			)
+			view.Diagnostics(diags)
 			return 1
 		}
 
@@ -71,53 +103,78 @@ func (c *StatePushCommand) Run(args []string) int {
 		c.Close()
 	}
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error reading source state %q: %s", args[0], err))
+		diags = diags.Append(
+			tfdiags.Sourceless(
+				tfdiags.Error,
+				"Failed to read source state",
+				fmt.Sprintf("Error reading source state %q: %s", parsedArgs.Path, err),
+			),
+		)
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Load the backend
-	b, backendDiags := c.Backend(nil)
-	if backendDiags.HasErrors() {
-		c.showDiagnostics(backendDiags)
+	b, diags := c.backend(".", parsedArgs.ViewType)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Determine the workspace name
 	workspace, err := c.Workspace()
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error selecting workspace: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to select workspace",
+			fmt.Sprintf("Error selecting workspace: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Check remote Terraform version is compatible
 	remoteVersionDiags := c.remoteVersionCheck(b, workspace)
-	c.showDiagnostics(remoteVersionDiags)
+	diags = diags.Append(remoteVersionDiags)
 	if remoteVersionDiags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Get the state manager for the currently-selected workspace
-	stateMgr, err := b.StateMgr(workspace)
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load destination state: %s", err))
+	stateMgr, sDiags := b.StateMgr(workspace)
+	if sDiags.HasErrors() {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to access state",
+			fmt.Sprintf("Failed to access destination state: %s", sDiags.Err()),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	if c.stateLock {
-		stateLocker := clistate.NewLocker(c.stateLockTimeout, views.NewStateLocker(arguments.ViewHuman, c.View))
-		if diags := stateLocker.Lock(stateMgr, "state-push"); diags.HasErrors() {
-			c.showDiagnostics(diags)
+		stateLocker := clistate.NewLocker(c.stateLockTimeout, views.NewStateLocker(parsedArgs.ViewType, c.View))
+		if lockDiags := stateLocker.Lock(stateMgr, "state-push"); lockDiags.HasErrors() {
+			diags = diags.Append(lockDiags)
+			view.Diagnostics(diags)
 			return 1
 		}
 		defer func() {
-			if diags := stateLocker.Unlock(); diags.HasErrors() {
-				c.showDiagnostics(diags)
+			if unlockDiags := stateLocker.Unlock(); unlockDiags.HasErrors() {
+				diags = diags.Append(unlockDiags)
+				view.Diagnostics(diags)
 			}
 		}()
 	}
 
 	if err := stateMgr.RefreshState(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to refresh destination state: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to refresh the state",
+			fmt.Sprintf("Error refreshing the destination state: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -127,28 +184,42 @@ func (c *StatePushCommand) Run(args []string) int {
 	}
 
 	// Import it, forcing through the lineage/serial if requested and possible.
-	if err := statemgr.Import(srcStateFile, stateMgr, flagForce); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to write state: %s", err))
+	if err := statemgr.Import(srcStateFile, stateMgr, parsedArgs.Force); err != nil {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to save the state",
+			fmt.Sprintf("Terraform encountered an error when saving state: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Get schemas, if possible, before writing state
 	var schemas *terraform.Schemas
-	var diags tfdiags.Diagnostics
 	if isCloudMode(b) {
 		schemas, diags = c.MaybeGetSchemas(srcStateFile.State, nil)
 	}
 
 	if err := stateMgr.WriteState(srcStateFile.State); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to write state: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to save the state",
+			fmt.Sprintf("Terraform encountered an error when saving state: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 	if err := stateMgr.PersistState(schemas); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to persist state: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to save the state",
+			fmt.Sprintf("Terraform encountered an error when saving state: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	c.showDiagnostics(diags)
+	view.Diagnostics(diags)
 	return 0
 }
 
@@ -172,6 +243,10 @@ Usage: terraform [global options] state push [options] PATH
 
 Options:
 
+  -compact-warnings   If Terraform produces any warnings that are not
+                      accompanied by errors, show them in a more compact
+                      form that includes only the summary messages
+
   -force              Write the state even if lineages don't match or the
                       remote serial is higher.
 
@@ -180,6 +255,17 @@ Options:
                       against the same workspace.
 
   -lock-timeout=0s    Duration to retry a state lock.
+
+  -no-color           Disable text coloring in the output.
+
+  -var 'foo=bar'      Set a value for one of the input variables in the root
+                      module of the configuration. Use this option more than
+                      once to set more than one variable.
+
+  -var-file=filename  Load variable values from the given file, in addition
+                      to the default files terraform.tfvars and *.auto.tfvars.
+                      Use this option more than once to include more than one
+                      variables file.
 
 `
 	return strings.TrimSpace(helpText)

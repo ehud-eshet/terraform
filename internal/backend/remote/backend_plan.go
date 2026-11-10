@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package remote
@@ -21,6 +21,7 @@ import (
 	version "github.com/hashicorp/go-version"
 
 	"github.com/hashicorp/terraform/internal/backend/backendrun"
+	"github.com/hashicorp/terraform/internal/cloud"
 	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -176,6 +177,23 @@ func (b *Remote) opPlan(stopCtx, cancelCtx context.Context, op *backendrun.Opera
 		}
 	}
 
+	if op.PlanMinimalRefresh {
+		desiredAPIVersion, _ := version.NewVersion(cloud.MinimalRefreshMinAPIVersion)
+
+		if parseErr != nil || currentAPIVersion.LessThan(desiredAPIVersion) {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Minimal refresh is not supported",
+				fmt.Sprintf(
+					`The host %s does not support the -minimal-refresh option. `+
+						`If you use Terraform Enterprise, upgrade to a version that `+
+						`supports minimal refresh. Otherwise, run without -minimal-refresh.`,
+					b.hostname,
+				),
+			))
+		}
+	}
+
 	// Return if there are any errors.
 	if diags.HasErrors() {
 		return nil, diags.Err()
@@ -258,19 +276,24 @@ in order to capture the filesystem context the remote workspace expects:
 		}
 	}
 
+	log.Printf("[TRACE] backend/remote: starting configuration upload at %q", configDir)
 	err = b.client.ConfigurationVersions.Upload(stopCtx, cv.UploadURL, configDir)
 	if err != nil {
 		return nil, generalError("Failed to upload configuration files", err)
 	}
+	log.Printf("[TRACE] backend/remote: finished configuration upload")
 
 	uploaded := false
 	for i := 0; i < 60 && !uploaded; i++ {
 		select {
 		case <-stopCtx.Done():
+			log.Printf("[TRACE] backend/remote: deadline reached while waiting for configuration status")
 			return nil, context.Canceled
 		case <-cancelCtx.Done():
+			log.Printf("[TRACE] backend/remote: operation cancelled while waiting for configuration status")
 			return nil, context.Canceled
 		case <-time.After(planConfigurationVersionsPollInterval):
+			log.Printf("[TRACE] backend/remote: reading configuration status")
 			cv, err = b.client.ConfigurationVersions.Read(stopCtx, cv.ID)
 			if err != nil {
 				return nil, generalError("Failed to retrieve configuration version", err)
@@ -287,10 +310,17 @@ in order to capture the filesystem context the remote workspace expects:
 			"Failed to upload configuration files", errors.New("operation timed out"))
 	}
 
+	log.Printf("[TRACE] backend/remote: configuration uploaded and ready")
 	runOptions := tfe.RunCreateOptions{
 		ConfigurationVersion: cv,
 		Refresh:              tfe.Bool(op.PlanRefresh),
 		Workspace:            w,
+	}
+
+	// Only send the minimal-refresh attribute when requested, so that it is
+	// never included for ordinary runs.
+	if op.PlanMinimalRefresh {
+		runOptions.MinimalRefresh = tfe.Bool(true)
 	}
 
 	switch op.PlanMode {
@@ -409,6 +439,15 @@ in order to capture the filesystem context the remote workspace expects:
 	r, err = b.client.Runs.Read(stopCtx, r.ID)
 	if err != nil {
 		return r, generalError("Failed to retrieve run", err)
+	}
+
+	// Wait for post plan tasks to complete before proceeding.
+	// Otherwise, in the case of an apply, if they are still running
+	// when we check for whether the run is confirmable the CLI will
+	// uncermoniously exit before the user has a chance to confirm, or for an auto-apply to take place.
+	err = b.waitForPostPlanTasks(stopCtx, cancelCtx, r)
+	if err != nil {
+		return r, err
 	}
 
 	// If the run is canceled or errored, we still continue to the

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package tfdiags
@@ -138,19 +138,23 @@ func TraversalStr(traversal hcl.Traversal) string {
 	return buf.String()
 }
 
-// FormatValueStr produces a JSON-compatible, human-readable representation of a
-// cty.Value that is suitable for display in the UI.
+// FormatValueStrUnderTest produces a JSON-compatible, human-readable representation of a
+// cty.Value that is suitable for display in the UI in the context of a test run.
 //
 // The full representation of the value is produced, but with some redaction to
 // nodes within the value sensitive and ephemeral marks.
 // e.g {"a": "10", "b": "password"} => {"a": "10", "b": "(sensitive value)"}
-func FormatValueStr(val cty.Value) (string, error) {
+func FormatValueStrUnderTest(val cty.Value) (string, error) {
 	var buf bytes.Buffer
 
 	val, err := cty.Transform(val, func(path cty.Path, val cty.Value) (cty.Value, error) {
+		// Remove any deprecation marks as we consider them
+		// not relevant in the context of test outputs
+		val, _ = marks.GetDeprecationMarks(val)
+
 		// If a value is sensitive or ephemeral or unknown, we redact it, otherwise
 		// we return the value as is.
-		if val.HasMark(marks.Sensitive) || val.HasMark(marks.Ephemeral) || !val.IsKnown() {
+		if marks.Has(val, marks.Sensitive) || marks.Has(val, marks.Ephemeral) || !val.IsKnown() {
 			return cty.StringVal(CompactValueStr(val)), nil
 		}
 		return val, nil

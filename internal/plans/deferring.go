@@ -1,11 +1,10 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package plans
 
 import (
 	"github.com/hashicorp/terraform/internal/providers"
-	"github.com/zclconf/go-cty/cty"
 )
 
 // DeferredResourceInstanceChangeSrc tracks information about a resource that
@@ -19,8 +18,8 @@ type DeferredResourceInstanceChangeSrc struct {
 	ChangeSrc *ResourceInstanceChangeSrc
 }
 
-func (rcs *DeferredResourceInstanceChangeSrc) Decode(ty cty.Type) (*DeferredResourceInstanceChange, error) {
-	change, err := rcs.ChangeSrc.Decode(ty)
+func (rcs *DeferredResourceInstanceChangeSrc) Decode(schema providers.Schema) (*DeferredResourceInstanceChange, error) {
+	change, err := rcs.ChangeSrc.Decode(schema)
 	if err != nil {
 		return nil, err
 	}
@@ -42,8 +41,8 @@ type DeferredResourceInstanceChange struct {
 	Change *ResourceInstanceChange
 }
 
-func (rcs *DeferredResourceInstanceChange) Encode(ty cty.Type) (*DeferredResourceInstanceChangeSrc, error) {
-	change, err := rcs.Change.Encode(ty)
+func (rcs *DeferredResourceInstanceChange) Encode(schema providers.Schema) (*DeferredResourceInstanceChangeSrc, error) {
+	change, err := rcs.Change.Encode(schema)
 	if err != nil {
 		return nil, err
 	}
@@ -51,5 +50,49 @@ func (rcs *DeferredResourceInstanceChange) Encode(ty cty.Type) (*DeferredResourc
 	return &DeferredResourceInstanceChangeSrc{
 		DeferredReason: rcs.DeferredReason,
 		ChangeSrc:      change,
+	}, nil
+}
+
+// DeferredActionInvocation tracks information about an action invocation
+// that has been deferred for some reason.
+type DeferredActionInvocation struct {
+	// DeferredReason is the reason why this action invocation was deferred.
+	DeferredReason providers.DeferredReason
+
+	// ActionInvocationInstance is the instance of the action invocation that was deferred.
+	ActionInvocationInstance *ActionInvocationInstance
+}
+
+func (dai *DeferredActionInvocation) Encode(schema *providers.ActionSchema) (*DeferredActionInvocationSrc, error) {
+	src, err := dai.ActionInvocationInstance.Encode(schema)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DeferredActionInvocationSrc{
+		DeferredReason:              dai.DeferredReason,
+		ActionInvocationInstanceSrc: src,
+	}, nil
+}
+
+// DeferredActionInvocationSrc tracks information about an action invocation
+// that has been deferred for some reason.
+type DeferredActionInvocationSrc struct {
+	// DeferredReason is the reason why this action invocation was deferred.
+	DeferredReason providers.DeferredReason
+
+	// ActionInvocationInstanceSrc is the instance of the action invocation that was deferred.
+	ActionInvocationInstanceSrc *ActionInvocationInstanceSrc
+}
+
+func (dais *DeferredActionInvocationSrc) Decode(schema *providers.ActionSchema) (*DeferredActionInvocation, error) {
+	instance, err := dais.ActionInvocationInstanceSrc.Decode(schema)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DeferredActionInvocation{
+		DeferredReason:           dais.DeferredReason,
+		ActionInvocationInstance: instance,
 	}, nil
 }

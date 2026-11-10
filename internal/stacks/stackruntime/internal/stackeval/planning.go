@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package stackeval
@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/plans"
-	"github.com/hashicorp/terraform/internal/providers"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/stacks/stackruntime/hooks"
-	"github.com/hashicorp/terraform/internal/stacks/stackruntime/internal/stackeval/stubs"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -31,6 +29,8 @@ type PlanOpts struct {
 	PlanTimestamp time.Time
 
 	DependencyLocks depsfile.Locks
+
+	PolicyClient policy.Client
 }
 
 // Plannable is implemented by objects that can participate in planning.
@@ -58,14 +58,70 @@ type Plannable interface {
 	tracingNamer
 }
 
-func PlanComponentInstance(ctx context.Context, main *Main, state *states.State, opts *terraform.PlanOpts, scope ConfigComponentExpressionScope[stackaddrs.AbsComponentInstance]) (*plans.Plan, tfdiags.Diagnostics) {
-	var diags tfdiags.Diagnostics
-
+func ReportComponentInstance(ctx context.Context, plan *plans.Plan, h *Hooks, seq *hookSeq, scope ConfigComponentExpressionScope[stackaddrs.AbsComponentInstance]) {
 	addr := scope.Addr()
 
-	h := hooksFromContext(ctx)
-	hookSingle(ctx, hooksFromContext(ctx).PendingComponentInstancePlan, addr)
-	seq, ctx := hookBegin(ctx, h.BeginComponentInstancePlan, h.ContextAttach, addr)
+	cic := &hooks.ComponentInstanceChange{
+		Addr: addr,
+	}
+
+	for _, rsrcChange := range plan.DriftedResources {
+		hookMore(ctx, seq, h.ReportResourceInstanceDrift, &hooks.ResourceInstanceChange{
+			Addr: stackaddrs.AbsResourceInstanceObject{
+				Component: addr,
+				Item:      rsrcChange.ObjectAddr(),
+			},
+			Change: rsrcChange,
+		})
+	}
+	for _, rsrcChange := range plan.Changes.Resources {
+		if rsrcChange.Importing != nil {
+			cic.Import++
+		}
+		if rsrcChange.Moved() {
+			cic.Move++
+		}
+		cic.CountNewAction(rsrcChange.Action)
+
+		hookMore(ctx, seq, h.ReportResourceInstancePlanned, &hooks.ResourceInstanceChange{
+			Addr: stackaddrs.AbsResourceInstanceObject{
+				Component: addr,
+				Item:      rsrcChange.ObjectAddr(),
+			},
+			Change: rsrcChange,
+		})
+	}
+	for _, rsrcChange := range plan.DeferredResources {
+		cic.Defer++
+		hookMore(ctx, seq, h.ReportResourceInstanceDeferred, &hooks.DeferredResourceInstanceChange{
+			Reason: rsrcChange.DeferredReason,
+			Change: &hooks.ResourceInstanceChange{
+				Addr: stackaddrs.AbsResourceInstanceObject{
+					Component: addr,
+					Item:      rsrcChange.ChangeSrc.ObjectAddr(),
+				},
+				Change: rsrcChange.ChangeSrc,
+			},
+		})
+	}
+
+	for _, actInvoke := range plan.Changes.ActionInvocations {
+		cic.ActionInvocation++
+		hookMore(ctx, seq, h.ReportActionInvocationPlanned, &hooks.ActionInvocation{
+			Addr: stackaddrs.AbsActionInvocationInstance{
+				Component: addr,
+				Item:      actInvoke.Addr,
+			},
+			ProviderAddr: actInvoke.ProviderAddr.Provider,
+			Trigger:      actInvoke.ActionTrigger,
+		})
+	}
+
+	hookMore(ctx, seq, h.ReportComponentInstancePlanned, cic)
+}
+
+func PlanComponentInstance(ctx context.Context, main *Main, state *states.State, opts *terraform.PlanOpts, tfHooks []terraform.Hook, scope ConfigComponentExpressionScope[stackaddrs.AbsComponentInstance]) (*plans.Plan, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
 
 	// This is our main bridge from the stacks language into the main Terraform
 	// module language during the planning phase. We need to ask the main
@@ -104,29 +160,10 @@ func PlanComponentInstance(ctx context.Context, main *Main, state *states.State,
 	// configurations from the stack that exist outside of Terraform's
 	// concerns. There are provided directly in the PlanOpts argument.
 
-	providerFactories := make(map[addrs.Provider]providers.Factory, len(providerSchemas))
-	for addr := range providerSchemas {
-		providerFactories[addr] = func() (providers.Interface, error) {
-			// Lazily fetch the unconfigured client for the provider
-			// as and when we need it.
-			provider, err := main.ProviderType(ctx, addr).UnconfiguredClient()
-			if err != nil {
-				return nil, err
-			}
-			// this provider should only be used for selected operations
-			return stubs.OfflineProvider(provider), nil
-		}
-	}
+	providerFactories := unconfiguredProviderFactories(main, providerSchemas, opts.ExternalProviders)
 
 	tfCtx, err := terraform.NewContext(&terraform.ContextOpts{
-		Hooks: []terraform.Hook{
-			&componentInstanceTerraformHook{
-				ctx:   ctx,
-				seq:   seq,
-				hooks: hooksFromContext(ctx),
-				addr:  addr,
-			},
-		},
+		Hooks:                    tfHooks,
 		Providers:                providerFactories,
 		PreloadedProviderSchemas: providerSchemas,
 		Provisioners:             main.availableProvisioners(),
@@ -157,64 +194,6 @@ func PlanComponentInstance(ctx context.Context, main *Main, state *states.State,
 
 	plan, moreDiags := tfCtx.Plan(moduleTree, state, opts)
 	diags = diags.Append(moreDiags)
-
-	if plan != nil {
-		cic := &hooks.ComponentInstanceChange{
-			Addr: addr,
-		}
-
-		for _, rsrcChange := range plan.DriftedResources {
-			hookMore(ctx, seq, h.ReportResourceInstanceDrift, &hooks.ResourceInstanceChange{
-				Addr: stackaddrs.AbsResourceInstanceObject{
-					Component: addr,
-					Item:      rsrcChange.ObjectAddr(),
-				},
-				Change: rsrcChange,
-			})
-		}
-		for _, rsrcChange := range plan.Changes.Resources {
-			if rsrcChange.Importing != nil {
-				cic.Import++
-			}
-			if rsrcChange.Moved() {
-				cic.Move++
-			}
-			cic.CountNewAction(rsrcChange.Action)
-
-			hookMore(ctx, seq, h.ReportResourceInstancePlanned, &hooks.ResourceInstanceChange{
-				Addr: stackaddrs.AbsResourceInstanceObject{
-					Component: addr,
-					Item:      rsrcChange.ObjectAddr(),
-				},
-				Change: rsrcChange,
-			})
-		}
-		for _, rsrcChange := range plan.DeferredResources {
-			cic.Defer++
-			hookMore(ctx, seq, h.ReportResourceInstanceDeferred, &hooks.DeferredResourceInstanceChange{
-				Reason: rsrcChange.DeferredReason,
-				Change: &hooks.ResourceInstanceChange{
-					Addr: stackaddrs.AbsResourceInstanceObject{
-						Component: addr,
-						Item:      rsrcChange.ChangeSrc.ObjectAddr(),
-					},
-					Change: rsrcChange.ChangeSrc,
-				},
-			})
-		}
-		hookMore(ctx, seq, h.ReportComponentInstancePlanned, cic)
-	}
-
-	if diags.HasErrors() {
-		hookMore(ctx, seq, h.ErrorComponentInstancePlan, addr)
-	} else {
-		if plan.Complete {
-			hookMore(ctx, seq, h.EndComponentInstancePlan, addr)
-
-		} else {
-			hookMore(ctx, seq, h.DeferComponentInstancePlan, addr)
-		}
-	}
 
 	return plan, diags
 }

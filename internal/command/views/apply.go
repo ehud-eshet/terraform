@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package views
@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/terraform/internal/command/arguments"
-	"github.com/hashicorp/terraform/internal/command/format"
 	"github.com/hashicorp/terraform/internal/command/views/json"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/terraform"
@@ -16,6 +15,8 @@ import (
 
 // The Apply view is used for the apply command.
 type Apply interface {
+	JSONOutputVersionLogger
+
 	ResourceCount(stateOutPath string)
 	Outputs(outputValues map[string]*states.OutputValue)
 
@@ -58,32 +59,38 @@ type ApplyHuman struct {
 	countHook *countHook
 }
 
+func (v *ApplyHuman) Version() {}
+
 var _ Apply = (*ApplyHuman)(nil)
 
 func (v *ApplyHuman) ResourceCount(stateOutPath string) {
+	var summary string
 	if v.destroy {
-		v.view.streams.Printf(
-			v.view.colorize.Color("[reset][bold][green]\nDestroy complete! Resources: %d destroyed.\n"),
-			v.countHook.Removed,
-		)
+		summary = fmt.Sprintf("Destroy complete! Resources: %d destroyed.", v.countHook.Removed)
 	} else if v.countHook.Imported > 0 {
-		v.view.streams.Printf(
-			v.view.colorize.Color("[reset][bold][green]\nApply complete! Resources: %d imported, %d added, %d changed, %d destroyed.\n"),
+		summary = fmt.Sprintf("Apply complete! Resources: %d imported, %d added, %d changed, %d destroyed.",
 			v.countHook.Imported,
 			v.countHook.Added,
 			v.countHook.Changed,
-			v.countHook.Removed,
-		)
+			v.countHook.Removed)
 	} else {
-		v.view.streams.Printf(
-			v.view.colorize.Color("[reset][bold][green]\nApply complete! Resources: %d added, %d changed, %d destroyed.\n"),
+		summary = fmt.Sprintf("Apply complete! Resources: %d added, %d changed, %d destroyed.",
 			v.countHook.Added,
 			v.countHook.Changed,
-			v.countHook.Removed,
-		)
+			v.countHook.Removed)
 	}
+	v.view.streams.Print(v.view.colorize.Color("[reset][bold][green]\n" + summary))
+	if v.countHook.ActionInvocation > 0 {
+		msg := fmt.Sprintf("[reset][bold][green] Actions: %d invoked", v.countHook.ActionInvocation)
+		if v.countHook.ActionFail > 0 {
+			msg = fmt.Sprintf("%s, %d failed", msg, v.countHook.ActionFail)
+		}
+		v.view.streams.Print(v.view.colorize.Color(msg + "."))
+	}
+
+	v.view.streams.Print("\n")
 	if (v.countHook.Added > 0 || v.countHook.Changed > 0) && stateOutPath != "" {
-		v.view.streams.Printf("\n%s\n\n", format.WordWrap(stateOutPathPostApply, v.view.outputColumns()))
+		v.view.streams.Printf("\n%s\n\n", v.view.wrapToStdout(stateOutPathPostApply))
 		v.view.streams.Printf("State path: %s\n", stateOutPath)
 	}
 }
@@ -132,17 +139,23 @@ type ApplyJSON struct {
 
 var _ Apply = (*ApplyJSON)(nil)
 
+func (v *ApplyJSON) Version() {
+	v.view.Version()
+}
+
 func (v *ApplyJSON) ResourceCount(stateOutPath string) {
 	operation := json.OperationApplied
 	if v.destroy {
 		operation = json.OperationDestroyed
 	}
 	v.view.ChangeSummary(&json.ChangeSummary{
-		Add:       v.countHook.Added,
-		Change:    v.countHook.Changed,
-		Remove:    v.countHook.Removed,
-		Import:    v.countHook.Imported,
-		Operation: operation,
+		Add:              v.countHook.Added,
+		Change:           v.countHook.Changed,
+		Remove:           v.countHook.Removed,
+		Import:           v.countHook.Imported,
+		ActionInvocation: v.countHook.ActionInvocation,
+		ActionFail:       v.countHook.ActionFail,
+		Operation:        operation,
 	})
 }
 

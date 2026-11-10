@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -9,13 +9,20 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/configs/configschema"
+	"github.com/hashicorp/terraform/internal/deprecation"
+	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/moduletest/mocking"
 	"github.com/hashicorp/terraform/internal/namedvals"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/deferring"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/providers"
+	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/refactoring"
 	"github.com/hashicorp/terraform/internal/resources/ephemeral"
 	"github.com/hashicorp/terraform/internal/states"
@@ -48,6 +55,11 @@ type graphWalkOpts struct {
 	// DeferralAlowed indicates that the current runtime supports deferred actions.
 	DeferralAllowed bool
 
+	// PlannedDeferrals should be populated during the apply phase with the
+	// resource changes that were deferred during the plan phase, so that the
+	// apply walk can evaluate references to them.
+	PlannedDeferrals []*plans.DeferredResourceInstanceChange
+
 	// ExternalDependencyDeferred indicates that something that this entire
 	// configuration depends on (outside the view of this modules runtime)
 	// has deferred changes, and therefore we must treat _all_ actions
@@ -73,15 +85,19 @@ type graphWalkOpts struct {
 
 	MoveResults refactoring.MoveResults
 
-	ProviderFuncResults *providers.FunctionResults
+	FunctionResults *lang.FunctionResults
 
 	// Forget if set to true will cause the plan to forget all resources. This is
 	// only allowd in the context of a destroy plan.
 	Forget bool
+
+	ProviderLocks map[addrs.Provider]*depsfile.ProviderLock
+
+	PolicyClient policy.Client
 }
 
 func (c *Context) walk(graph *Graph, operation walkOperation, opts *graphWalkOpts) (*ContextGraphWalker, tfdiags.Diagnostics) {
-	log.Printf("[DEBUG] Starting graph walk: %s", operation.String())
+	log.Printf("[DEBUG] Starting graph walk: %s", operation)
 
 	walker := c.graphWalker(graph, operation, opts)
 
@@ -177,14 +193,16 @@ func (c *Context) graphWalker(graph *Graph, operation walkOperation, opts *graph
 	if opts.ExternalDependencyDeferred {
 		deferred.SetExternalDependencyDeferred()
 	}
+	deferred.LoadPlannedDeferrals(opts.PlannedDeferrals)
 
-	return &ContextGraphWalker{
+	walker := &ContextGraphWalker{
 		Context:                 c,
 		State:                   state,
 		Config:                  opts.Config,
 		RefreshState:            refreshState,
 		Overrides:               opts.Overrides,
 		PrevRunState:            prevRunState,
+		PolicyGraph:             newPolicySubgraph(),
 		Changes:                 changes.SyncWrapper(),
 		NamedValues:             namedvals.NewState(),
 		EphemeralResources:      ephemeral.NewResources(),
@@ -196,7 +214,18 @@ func (c *Context) graphWalker(graph *Graph, operation walkOperation, opts *graph
 		Operation:               operation,
 		StopContext:             c.runContext,
 		PlanTimestamp:           opts.PlanTimeTimestamp,
-		providerFuncResults:     opts.ProviderFuncResults,
+		functionResults:         opts.FunctionResults,
 		Forget:                  opts.Forget,
+		ProviderLocks:           opts.ProviderLocks,
+		PolicyClient:            opts.PolicyClient,
+		Deprecations:            deprecation.NewDeprecations(),
+		contexts:                collections.NewMap[evalContextScope, *BuiltinEvalContext](),
+		providerCache:           make(map[string]providers.Interface),
+		providerFuncCache:       make(map[string]providers.Interface),
+		providerSchemas:         make(map[string]providers.ProviderSchema),
+		provisionerCache:        make(map[string]provisioners.Interface),
+		provisionerSchemas:      make(map[string]*configschema.Block),
 	}
+
+	return walker
 }

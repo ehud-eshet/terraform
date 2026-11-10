@@ -1,6 +1,3 @@
-// Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: BUSL-1.1
-
 package providers
 
 import (
@@ -11,6 +8,7 @@ import (
 
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/hcl2shim"
+	"github.com/hashicorp/terraform/internal/lang/ephemeral"
 	"github.com/hashicorp/terraform/internal/moduletest/mocking"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -37,7 +35,8 @@ type Mock struct {
 	Provider Interface
 	Data     *configs.MockData
 
-	schema *GetProviderSchemaResponse
+	schema         *GetProviderSchemaResponse
+	identitySchema *GetResourceIdentitySchemasResponse
 }
 
 func (m *Mock) GetProviderSchema() GetProviderSchemaResponse {
@@ -66,6 +65,16 @@ func (m *Mock) GetProviderSchema() GetProviderSchemaResponse {
 	return *m.schema
 }
 
+func (m *Mock) GetResourceIdentitySchemas() GetResourceIdentitySchemasResponse {
+	if m.identitySchema == nil {
+		// Cache the schema, it's not changing.
+		schema := m.Provider.GetResourceIdentitySchemas()
+
+		m.identitySchema = &schema
+	}
+	return *m.identitySchema
+}
+
 func (m *Mock) ValidateProviderConfig(request ValidateProviderConfigRequest) (response ValidateProviderConfigResponse) {
 	// The config for the mocked providers is consistent, and validated when we
 	// parse the HCL directly. So we'll just make no change here.
@@ -86,6 +95,20 @@ func (m *Mock) ValidateDataResourceConfig(request ValidateDataResourceConfigRequ
 	// support the same data source syntax as the original provider and we can
 	// call validate without needing to configure the provider first.
 	return m.Provider.ValidateDataResourceConfig(request)
+}
+
+func (m *Mock) ValidateListResourceConfig(request ValidateListResourceConfigRequest) ValidateListResourceConfigResponse {
+	// We'll just pass this through to the underlying provider. The mock should
+	// support the same data source syntax as the original provider and we can
+	// call validate without needing to configure the provider first.
+	return m.Provider.ValidateListResourceConfig(request)
+}
+
+func (m *Mock) ValidateActionConfig(request ValidateActionConfigRequest) ValidateActionConfigResponse {
+	// We'll just pass this through to the underlying provider. The mock should
+	// support the same data source syntax as the original provider and we can
+	// call validate without needing to configure the provider first.
+	return m.Provider.ValidateActionConfig(request)
 }
 
 func (m *Mock) UpgradeResourceState(request UpgradeResourceStateRequest) (response UpgradeResourceStateResponse) {
@@ -127,7 +150,41 @@ func (m *Mock) UpgradeResourceState(request UpgradeResourceStateRequest) (respon
 		response.Diagnostics = response.Diagnostics.Append(err)
 		return response
 	}
-	response.UpgradedState = value
+	response.UpgradedState = ephemeral.StripWriteOnlyAttributes(value, resource.Body)
+	return response
+}
+
+func (m *Mock) UpgradeResourceIdentity(request UpgradeResourceIdentityRequest) (response UpgradeResourceIdentityResponse) {
+	// We can't do this from a mocked provider, so we just return whatever identity
+	// is in the request back unchanged.
+
+	schema := m.GetProviderSchema()
+	response.Diagnostics = response.Diagnostics.Append(schema.Diagnostics)
+	if schema.Diagnostics.HasErrors() {
+		// We couldn't retrieve the schema for some reason, so the mock
+		// provider can't really function.
+		return response
+	}
+
+	resource, exists := schema.ResourceTypes[request.TypeName]
+	if !exists {
+		// This means something has gone wrong much earlier, we should have
+		// failed a validation somewhere if a resource type doesn't exist.
+		panic(fmt.Errorf("failed to retrieve identity schema for resource %s", request.TypeName))
+	}
+
+	schemaType := resource.Identity.ImpliedType()
+	value, err := ctyjson.Unmarshal(request.RawIdentityJSON, schemaType)
+
+	if err != nil {
+		// Generally, we shouldn't get an error here. The mocked providers are
+		// only used in tests, and we can't use different versions of providers
+		// within/between tests so the types should always match up. As such,
+		// we're not gonna return a super detailed error here.
+		response.Diagnostics = response.Diagnostics.Append(err)
+		return response
+	}
+	response.UpgradedIdentity = value
 	return response
 }
 
@@ -149,6 +206,7 @@ func (m *Mock) ReadResource(request ReadResourceRequest) ReadResourceResponse {
 	// state. So we'll return what we have.
 	return ReadResourceResponse{
 		NewState: request.PriorState,
+		Identity: request.CurrentIdentity,
 	}
 }
 
@@ -161,26 +219,25 @@ func (m *Mock) PlanResourceChange(request PlanResourceChangeRequest) PlanResourc
 		}
 	}
 
+	var response PlanResourceChangeResponse
+	schema := m.GetProviderSchema()
+	response.Diagnostics = response.Diagnostics.Append(schema.Diagnostics)
+	if schema.Diagnostics.HasErrors() {
+		// We couldn't retrieve the schema for some reason, so the mock
+		// provider can't really function.
+		return response
+	}
+
+	resource, exists := schema.ResourceTypes[request.TypeName]
+	if !exists {
+		// This means something has gone wrong much earlier, we should have
+		// failed a validation somewhere if a resource type doesn't exist.
+		panic(fmt.Errorf("failed to retrieve schema for resource %s", request.TypeName))
+	}
+
 	if request.PriorState.IsNull() {
 		// Then we are creating this resource - we need to populate the computed
 		// null fields with unknowns so Terraform will render them properly.
-
-		var response PlanResourceChangeResponse
-
-		schema := m.GetProviderSchema()
-		response.Diagnostics = response.Diagnostics.Append(schema.Diagnostics)
-		if schema.Diagnostics.HasErrors() {
-			// We couldn't retrieve the schema for some reason, so the mock
-			// provider can't really function.
-			return response
-		}
-
-		resource, exists := schema.ResourceTypes[request.TypeName]
-		if !exists {
-			// This means something has gone wrong much earlier, we should have
-			// failed a validation somewhere if a resource type doesn't exist.
-			panic(fmt.Errorf("failed to retrieve schema for resource %s", request.TypeName))
-		}
 
 		replacement := &mocking.MockedData{
 			Value:             cty.NilVal, // If we have no data then we use cty.NilVal.
@@ -195,17 +252,16 @@ func (m *Mock) PlanResourceChange(request PlanResourceChangeRequest) PlanResourc
 
 		value, diags := mocking.PlanComputedValuesForResource(request.ProposedNewState, replacement, resource.Body)
 		response.Diagnostics = response.Diagnostics.Append(diags)
-		response.PlannedState = value
+		response.PlannedState = ephemeral.StripWriteOnlyAttributes(value, resource.Body)
 		response.PlannedPrivate = []byte("create")
 		return response
 	}
 
 	// Otherwise, we're just doing a simple update and we don't need to populate
 	// any values for that.
-	return PlanResourceChangeResponse{
-		PlannedState:   request.ProposedNewState,
-		PlannedPrivate: []byte("update"),
-	}
+	response.PlannedState = ephemeral.StripWriteOnlyAttributes(request.ProposedNewState, resource.Body)
+	response.PlannedPrivate = []byte("update")
+	return response
 }
 
 func (m *Mock) ApplyResourceChange(request ApplyResourceChangeRequest) ApplyResourceChangeResponse {
@@ -242,13 +298,15 @@ func (m *Mock) ApplyResourceChange(request ApplyResourceChangeRequest) ApplyReso
 		value, diags := mocking.ApplyComputedValuesForResource(request.PlannedState, replacement, resource.Body)
 		response.Diagnostics = response.Diagnostics.Append(diags)
 		response.NewState = value
+		response.NewIdentity = request.PlannedIdentity
 		return response
 
 	default:
 		// For update or destroy operations, we don't have to create any values
 		// so we'll just return the planned state directly.
 		return ApplyResourceChangeResponse{
-			NewState: request.PlannedState,
+			NewState:    request.PlannedState,
+			NewIdentity: request.PlannedIdentity,
 		}
 	}
 }
@@ -260,6 +318,10 @@ func (m *Mock) ImportResourceState(request ImportResourceStateRequest) (response
 	// of all resources that are backed by mock providers.
 	response.Diagnostics = response.Diagnostics.Append(tfdiags.Sourceless(tfdiags.Error, "Invalid import request", "Cannot import resources from mock providers. Use an `override_resource` block to targeting the specific resource being imported instead."))
 	return response
+}
+
+func (m *Mock) GenerateResourceConfig(request GenerateResourceConfigRequest) (response GenerateResourceConfigResponse) {
+	panic("not implemented")
 }
 
 func (m *Mock) MoveResourceState(request MoveResourceStateRequest) MoveResourceStateResponse {
@@ -296,67 +358,106 @@ func (m *Mock) ReadDataSource(request ReadDataSourceRequest) ReadDataSourceRespo
 
 	value, diags := mocking.ComputedValuesForDataSource(request.Config, mockedData, datasource.Body)
 	response.Diagnostics = response.Diagnostics.Append(diags)
-	response.State = value
+	response.State = ephemeral.StripWriteOnlyAttributes(value, datasource.Body)
 	return response
 }
 
-func (m *Mock) ValidateEphemeralResourceConfig(ValidateEphemeralResourceConfigRequest) ValidateEphemeralResourceConfigResponse {
-	var diags tfdiags.Diagnostics
-	diags = diags.Append(tfdiags.AttributeValue(
-		tfdiags.Error,
-		"No ephemeral resource types in mock providers",
-		"The provider mocking mechanism does not yet support ephemeral resource types.",
-		nil, // the topmost configuration object
-	))
-	return ValidateEphemeralResourceConfigResponse{
-		Diagnostics: diags,
-	}
+func (m *Mock) ValidateEphemeralResourceConfig(request ValidateEphemeralResourceConfigRequest) ValidateEphemeralResourceConfigResponse {
+	// Delegate to the underlying provider so it can validate the configuration
+	// against the real schema, exactly as we do for resources and data sources.
+	return m.Provider.ValidateEphemeralResourceConfig(request)
 }
 
-func (m *Mock) OpenEphemeralResource(OpenEphemeralResourceRequest) OpenEphemeralResourceResponse {
-	// FIXME: Design some means to mock an ephemeral resource type.
-	var diags tfdiags.Diagnostics
-	diags = diags.Append(tfdiags.AttributeValue(
-		tfdiags.Error,
-		"No ephemeral resource types in mock providers",
-		"The provider mocking mechanism does not yet support ephemeral resource types.",
-		nil, // the topmost configuration object
-	))
-	return OpenEphemeralResourceResponse{
-		Diagnostics: diags,
+func (m *Mock) OpenEphemeralResource(request OpenEphemeralResourceRequest) OpenEphemeralResourceResponse {
+	var response OpenEphemeralResourceResponse
+
+	schema := m.GetProviderSchema()
+	response.Diagnostics = response.Diagnostics.Append(schema.Diagnostics)
+	if schema.Diagnostics.HasErrors() {
+		return response
 	}
+
+	ephemeralSchema, exists := schema.EphemeralResourceTypes[request.TypeName]
+	if !exists {
+		// Should have been caught during validation.
+		panic(fmt.Errorf("failed to retrieve schema for ephemeral resource %s", request.TypeName))
+	}
+
+	mockedData := &mocking.MockedData{
+		Value: cty.NilVal, // If we have no mocked data we use cty.NilVal.
+	}
+	if mockedEphemeral, exists := m.Data.MockEphemeralResources[request.TypeName]; exists {
+		mockedData.Value = mockedEphemeral.Defaults
+		mockedData.Range = mockedEphemeral.DefaultsRange
+	}
+
+	value, diags := mocking.ComputedValuesForDataSource(request.Config, mockedData, ephemeralSchema.Body)
+	response.Diagnostics = response.Diagnostics.Append(diags)
+	response.Result = value
+	return response
 }
 
 func (m *Mock) RenewEphemeralResource(RenewEphemeralResourceRequest) RenewEphemeralResourceResponse {
-	// FIXME: Design some means to mock an ephemeral resource type.
-	var diags tfdiags.Diagnostics
-	diags = diags.Append(tfdiags.AttributeValue(
-		tfdiags.Error,
-		"No ephemeral resource types in mock providers",
-		"The provider mocking mechanism does not yet support ephemeral resource types.",
-		nil, // the topmost configuration object
-	))
-	return RenewEphemeralResourceResponse{
-		Diagnostics: diags,
-	}
+	// Mocked ephemeral resources never expire, so renewal is a no-op.
+	return RenewEphemeralResourceResponse{}
 }
 
 func (m *Mock) CloseEphemeralResource(CloseEphemeralResourceRequest) CloseEphemeralResourceResponse {
-	// FIXME: Design some means to mock an ephemeral resource type.
-	var diags tfdiags.Diagnostics
-	diags = diags.Append(tfdiags.AttributeValue(
-		tfdiags.Error,
-		"No ephemeral resource types in mock providers",
-		"The provider mocking mechanism does not yet support ephemeral resource types.",
-		nil, // the topmost configuration object
-	))
-	return CloseEphemeralResourceResponse{
-		Diagnostics: diags,
-	}
+	// Nothing to close for a mocked ephemeral resource.
+	return CloseEphemeralResourceResponse{}
 }
 
 func (m *Mock) CallFunction(request CallFunctionRequest) CallFunctionResponse {
 	return m.Provider.CallFunction(request)
+}
+
+func (m *Mock) ListResource(request ListResourceRequest) ListResourceResponse {
+	return m.Provider.ListResource(request)
+}
+
+func (m *Mock) ValidateStateStoreConfig(req ValidateStateStoreConfigRequest) ValidateStateStoreConfigResponse {
+	return m.Provider.ValidateStateStoreConfig(req)
+}
+
+func (m *Mock) ConfigureStateStore(req ConfigureStateStoreRequest) ConfigureStateStoreResponse {
+	return m.Provider.ConfigureStateStore(req)
+}
+
+func (m *Mock) ReadStateBytes(req ReadStateBytesRequest) ReadStateBytesResponse {
+	return m.Provider.ReadStateBytes(req)
+}
+
+func (m *Mock) WriteStateBytes(req WriteStateBytesRequest) WriteStateBytesResponse {
+	return m.Provider.WriteStateBytes(req)
+}
+
+func (m *Mock) LockState(req LockStateRequest) LockStateResponse {
+	return m.Provider.LockState(req)
+}
+
+func (m *Mock) UnlockState(req UnlockStateRequest) UnlockStateResponse {
+	return m.Provider.UnlockState(req)
+}
+
+func (m *Mock) GetStates(req GetStatesRequest) GetStatesResponse {
+	return m.Provider.GetStates(req)
+}
+
+func (m *Mock) DeleteState(req DeleteStateRequest) DeleteStateResponse {
+	return m.Provider.DeleteState(req)
+}
+
+func (m *Mock) PlanAction(request PlanActionRequest) PlanActionResponse {
+	return PlanActionResponse{}
+}
+
+func (m *Mock) InvokeAction(request InvokeActionRequest) InvokeActionResponse {
+	return InvokeActionResponse{
+		Events: func(yield func(InvokeActionEvent) bool) {
+			yield(InvokeActionEvent_Completed{})
+		},
+		Diagnostics: nil,
+	}
 }
 
 func (m *Mock) Close() error {

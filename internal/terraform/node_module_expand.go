@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -22,6 +22,10 @@ type nodeExpandModule struct {
 	Addr       addrs.Module
 	Config     *configs.Module
 	ModuleCall *configs.ModuleCall
+
+	// ModuleTree is the configuration bundle within the source that this module call
+	// refers to.
+	ModuleTree *configs.Config
 }
 
 var (
@@ -29,10 +33,7 @@ var (
 	_ GraphNodeReferenceable    = (*nodeExpandModule)(nil)
 	_ GraphNodeReferencer       = (*nodeExpandModule)(nil)
 	_ GraphNodeReferenceOutside = (*nodeExpandModule)(nil)
-	_ graphNodeExpandsInstances = (*nodeExpandModule)(nil)
 )
-
-func (n *nodeExpandModule) expandsInstances() {}
 
 func (n *nodeExpandModule) Name() string {
 	return n.Addr.String() + " (expand)"
@@ -115,6 +116,10 @@ func (n *nodeExpandModule) Execute(globalCtx EvalContext, op walkOperation) (dia
 	expander := globalCtx.InstanceExpander()
 	_, call := n.Addr.Call()
 
+	if n.ModuleCall.IgnoreNestedDeprecations {
+		globalCtx.Deprecations().SuppressModuleCallDeprecation(n.Addr)
+	}
+
 	// Allowing unknown values in count and for_each is a top-level plan option.
 	//
 	// If this is false then the codepaths that handle unknown values below
@@ -140,6 +145,7 @@ func (n *nodeExpandModule) Execute(globalCtx EvalContext, op walkOperation) (dia
 			} else {
 				// -1 represents "unknown"
 				expander.SetModuleCountUnknown(module, call)
+				globalCtx.Deferrals().ReportModuleExpansionDeferred(module.UnexpandedChild(call))
 			}
 
 		case n.ModuleCall.ForEach != nil:
@@ -152,6 +158,7 @@ func (n *nodeExpandModule) Execute(globalCtx EvalContext, op walkOperation) (dia
 				expander.SetModuleForEach(module, call, forEach)
 			} else {
 				expander.SetModuleForEachUnknown(module, call)
+				globalCtx.Deferrals().ReportModuleExpansionDeferred(module.UnexpandedChild(call))
 			}
 
 		default:
@@ -160,7 +167,6 @@ func (n *nodeExpandModule) Execute(globalCtx EvalContext, op walkOperation) (dia
 	}
 
 	return diags
-
 }
 
 // nodeCloseModule represents an expanded module during apply, and is visited
@@ -263,6 +269,10 @@ var _ GraphNodeExecutable = (*nodeValidateModule)(nil)
 func (n *nodeValidateModule) Execute(globalCtx EvalContext, op walkOperation) (diags tfdiags.Diagnostics) {
 	_, call := n.Addr.Call()
 	expander := globalCtx.InstanceExpander()
+
+	if n.ModuleCall.IgnoreNestedDeprecations {
+		globalCtx.Deprecations().SuppressModuleCallDeprecation(n.Addr)
+	}
 
 	// Modules all evaluate to single instances during validation, only to
 	// create a proper context within which to evaluate. All parent modules

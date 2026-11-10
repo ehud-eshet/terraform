@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -9,6 +9,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -105,6 +106,10 @@ const (
 	// ValueFromCaller indicates that the value was explicitly overridden by
 	// a caller to Context.SetVariable after the context was constructed.
 	ValueFromCaller ValueSourceType = 'S'
+
+	// ValueFromCloud indicates that the value was retrieved from a remote source,
+	// such as HCP Terraform or Terraform Enterprise.
+	ValueFromCloud ValueSourceType = 'T'
 )
 
 func (v *InputValue) GoString() string {
@@ -153,6 +158,8 @@ func (v ValueSourceType) DiagnosticLabel() string {
 		return "set by an interactive input"
 	case ValueFromPlan:
 		return "set by the plan"
+	case ValueFromCloud:
+		return "set by the cloud backend"
 	default:
 		return "unknown"
 	}
@@ -179,6 +186,37 @@ func InputValuesFromCaller(vals map[string]cty.Value) InputValues {
 		}
 	}
 	return ret
+}
+
+// InputValuesFromPlan decodes the root module variable values recorded in
+// the given plan, re-applying any marks that were recorded alongside them.
+// Each resulting value has the source type ValueFromPlan.
+func InputValuesFromPlan(plan *plans.Plan) (InputValues, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+	ret := make(InputValues, len(plan.VariableValues))
+
+	for name, dyVal := range plan.VariableValues {
+		val, err := dyVal.Decode(cty.DynamicPseudoType)
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Invalid variable value in plan",
+				fmt.Sprintf("Invalid value for variable %q recorded in plan file: %s.", name, err),
+			))
+			continue
+		}
+
+		if pvm, ok := plan.VariableMarks[name]; ok {
+			val = val.MarkWithPaths(pvm)
+		}
+
+		ret[name] = &InputValue{
+			Value:      val,
+			SourceType: ValueFromPlan,
+		}
+	}
+
+	return ret, diags
 }
 
 // Override merges the given value maps with the receiver, overriding any

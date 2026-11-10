@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package arguments
@@ -69,6 +69,16 @@ func TestParseRefresh_invalid(t *testing.T) {
 	}
 }
 
+func TestParseRefresh_minimal_refresh(t *testing.T) {
+	_, diags := ParseRefresh([]string{"-minimal-refresh"})
+	if len(diags) == 0 {
+		t.Fatal("expected diags but got none")
+	}
+	if got, want := diags.Err().Error(), "Invalid mode option"; !strings.Contains(got, want) {
+		t.Fatalf("wrong diags\n got: %s\nwant: %s", got, want)
+	}
+}
+
 func TestParseRefresh_tooManyArguments(t *testing.T) {
 	got, diags := ParseRefresh([]string{"saved.tfplan"})
 	if len(diags) == 0 {
@@ -87,7 +97,7 @@ func TestParseRefresh_targets(t *testing.T) {
 	boop, _ := addrs.ParseTargetStr("module.boop")
 	testCases := map[string]struct {
 		args    []string
-		want    []addrs.Targetable
+		want    []addrs.TargetPattern
 		wantErr string
 	}{
 		"no targets by default": {
@@ -96,11 +106,11 @@ func TestParseRefresh_targets(t *testing.T) {
 		},
 		"one target": {
 			args: []string{"-target=foo_bar.baz"},
-			want: []addrs.Targetable{foobarbaz.Subject},
+			want: []addrs.TargetPattern{foobarbaz},
 		},
 		"two targets": {
 			args: []string{"-target=foo_bar.baz", "-target", "module.boop"},
-			want: []addrs.Targetable{foobarbaz.Subject, boop.Subject},
+			want: []addrs.TargetPattern{foobarbaz, boop},
 		},
 		"invalid traversal": {
 			args:    []string{"-target=foo."},

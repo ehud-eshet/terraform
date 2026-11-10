@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -119,10 +119,8 @@ func TestCloseProviderTransformer_withTargets(t *testing.T) {
 		&ProviderTransformer{},
 		&CloseProviderTransformer{},
 		&TargetsTransformer{
-			Targets: []addrs.Targetable{
-				addrs.RootModuleInstance.Resource(
-					addrs.ManagedResourceMode, "something", "else",
-				),
+			Targets: []addrs.TargetPattern{
+				mustTargetPattern("something.else"),
 			},
 		},
 	}

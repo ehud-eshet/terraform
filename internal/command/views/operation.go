@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package views
@@ -10,12 +10,12 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command/arguments"
-	"github.com/hashicorp/terraform/internal/command/format"
 	"github.com/hashicorp/terraform/internal/command/jsonformat"
 	"github.com/hashicorp/terraform/internal/command/jsonplan"
 	"github.com/hashicorp/terraform/internal/command/jsonprovider"
 	"github.com/hashicorp/terraform/internal/command/views/json"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/states/statefile"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -34,6 +34,9 @@ type Operation interface {
 	PlanNextStep(planPath string, genConfigPath string)
 
 	Diagnostics(diags tfdiags.Diagnostics)
+
+	PolicyDiagnostics(diags policy.Diagnostics)
+	PolicyResult(addr string, resp policy.EvaluationResponse)
 }
 
 func NewOperation(vt arguments.ViewType, inAutomation bool, view *View) Operation {
@@ -61,11 +64,11 @@ type OperationHuman struct {
 var _ Operation = (*OperationHuman)(nil)
 
 func (v *OperationHuman) Interrupted() {
-	v.view.streams.Println(format.WordWrap(interrupted, v.view.outputColumns()))
+	v.view.streams.Println(v.view.wrapToStdout(interrupted))
 }
 
 func (v *OperationHuman) FatalInterrupt() {
-	v.view.streams.Eprintln(format.WordWrap(fatalInterrupt, v.view.errorColumns()))
+	v.view.streams.Eprintln(v.view.wrapToStderr(fatalInterrupt))
 }
 
 func (v *OperationHuman) Stopping() {
@@ -92,7 +95,7 @@ func (v *OperationHuman) EmergencyDumpState(stateFile *statefile.File) error {
 }
 
 func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
-	outputs, changed, drift, attrs, err := jsonplan.MarshalForRenderer(plan, schemas)
+	jsonPlan, err := jsonplan.MarshalForRenderer(plan, schemas)
 	if err != nil {
 		v.view.streams.Eprintf("Failed to marshal plan to json: %s", err)
 		return
@@ -107,11 +110,13 @@ func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 	jplan := jsonformat.Plan{
 		PlanFormatVersion:     jsonplan.FormatVersion,
 		ProviderFormatVersion: jsonprovider.FormatVersion,
-		OutputChanges:         outputs,
-		ResourceChanges:       changed,
-		ResourceDrift:         drift,
+		OutputChanges:         jsonPlan.OutputChanges,
+		ResourceChanges:       jsonPlan.ResourceChanges,
+		ResourceDrift:         jsonPlan.ResourceDrift,
 		ProviderSchemas:       jsonprovider.MarshalForRenderer(schemas),
-		RelevantAttributes:    attrs,
+		RelevantAttributes:    jsonPlan.RelevantAttributes,
+		ActionInvocations:     jsonPlan.ActionInvocations,
+		DeferredChanges:       jsonPlan.DeferredChanges,
 	}
 
 	// Side load some data that we can't extract from the JSON plan.
@@ -128,6 +133,14 @@ func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 	}
 
 	renderer.RenderHumanPlan(jplan, plan.UIMode, opts...)
+}
+
+func (v *OperationHuman) PolicyDiagnostics(diags policy.Diagnostics) {
+	v.view.PolicyDiagnostics(diags)
+}
+
+func (v *OperationHuman) PolicyResult(addr string, resp policy.EvaluationResponse) {
+	v.view.PolicyResult(addr, resp)
 }
 
 func (v *OperationHuman) PlannedChange(change *plans.ResourceInstanceChangeSrc) {
@@ -147,24 +160,21 @@ func (v *OperationHuman) PlanNextStep(planPath string, genConfigPath string) {
 
 	if genConfigPath != "" {
 		v.view.streams.Println(
-			format.WordWrap(
-				"\n"+strings.TrimSpace(fmt.Sprintf(planHeaderGenConfig, genConfigPath)),
-				v.view.outputColumns(),
+			v.view.wrapToStdout(
+				"\n" + strings.TrimSpace(fmt.Sprintf(planHeaderGenConfig, genConfigPath)),
 			))
 	}
 
 	if planPath == "" {
 		v.view.streams.Println(
-			format.WordWrap(
-				"\n"+strings.TrimSpace(planHeaderNoOutput),
-				v.view.outputColumns(),
+			v.view.wrapToStdout(
+				"\n" + strings.TrimSpace(planHeaderNoOutput),
 			),
 		)
 	} else {
 		v.view.streams.Println(
-			format.WordWrap(
-				"\n"+strings.TrimSpace(fmt.Sprintf(planHeaderYesOutput, planPath, planPath)),
-				v.view.outputColumns(),
+			v.view.wrapToStdout(
+				"\n" + strings.TrimSpace(fmt.Sprintf(planHeaderYesOutput, planPath, planPath)),
 			),
 		)
 	}
@@ -247,11 +257,17 @@ func (v *OperationJSON) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 		case plans.CreateThenDelete, plans.DeleteThenCreate:
 			cs.Add++
 			cs.Remove++
+		case plans.ForgetThenCreate, plans.CreateThenForget:
+			cs.Add++
 		}
 
 		if change.Action != plans.NoOp || !change.Addr.Equal(change.PrevRunAddr) || change.Importing != nil {
 			v.view.PlannedChange(json.NewResourceInstanceChange(change))
 		}
+	}
+	cs.ActionInvocation = len(plan.Changes.ActionInvocations)
+	for _, action := range plan.Changes.ActionInvocations {
+		v.view.PlannedActionInvocation(json.NewPlannedActionInvocation(action))
 	}
 
 	v.view.ChangeSummary(cs)
@@ -265,6 +281,10 @@ func (v *OperationJSON) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 	}
 	if len(rootModuleOutputs) > 0 {
 		v.view.Outputs(json.OutputsFromChanges(rootModuleOutputs))
+	}
+
+	for _, deferredChange := range plan.DeferredResources {
+		v.view.DeferredChange(json.NewDeferredResourceInstanceChange(deferredChange))
 	}
 }
 
@@ -283,6 +303,14 @@ func (v *OperationJSON) PlanNextStep(planPath string, genConfigPath string) {
 
 func (v *OperationJSON) Diagnostics(diags tfdiags.Diagnostics) {
 	v.view.Diagnostics(diags)
+}
+
+func (v *OperationJSON) PolicyDiagnostics(diags policy.Diagnostics) {
+	v.view.PolicyDiagnostics(diags)
+}
+
+func (v *OperationJSON) PolicyResult(addr string, resp policy.EvaluationResponse) {
+	v.view.PolicyResult(addr, resp)
 }
 
 const fatalInterrupt = `

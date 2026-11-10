@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package addrs
@@ -29,6 +29,8 @@ func (r Resource) String() string {
 		return fmt.Sprintf("data.%s.%s", r.Type, r.Name)
 	case EphemeralResourceMode:
 		return fmt.Sprintf("ephemeral.%s.%s", r.Type, r.Name)
+	case ListResourceMode:
+		return fmt.Sprintf("list.%s.%s", r.Type, r.Name)
 	default:
 		// Should never happen, but we'll return a string here rather than
 		// crashing just in case it does.
@@ -187,32 +189,11 @@ func (r AbsResource) Config() ConfigResource {
 	}
 }
 
-// TargetContains implements Targetable by returning true if the given other
+// Contains implements Targetable by returning true if the given other
 // address is either equal to the receiver or is an instance of the
 // receiver.
-func (r AbsResource) TargetContains(other Targetable) bool {
-	switch to := other.(type) {
-
-	case AbsResource:
-		// We'll use our stringification as a cheat-ish way to test for equality.
-		return to.String() == r.String()
-
-	case ConfigResource:
-		// if an absolute resource from parsing a target address contains a
-		// ConfigResource, the string representation will match
-		return to.String() == r.String()
-
-	case AbsResourceInstance:
-		return r.TargetContains(to.ContainingResource())
-
-	default:
-		return false
-
-	}
-}
-
-func (r AbsResource) AddrType() TargetableAddrType {
-	return AbsResourceAddrType
+func (r AbsResource) Contains(other Targetable) bool {
+	return targetContains(r, other)
 }
 
 func (r AbsResource) String() string {
@@ -278,6 +259,11 @@ func (m ModuleInstance) ResourceInstance(mode ResourceMode, typeName string, nam
 	}
 }
 
+// ModuleInstance returns the module instance portion of the address.
+func (r AbsResourceInstance) ModuleInstance() ModuleInstance {
+	return r.Module
+}
+
 // ContainingResource returns the address of the resource that contains the
 // receving resource instance. In other words, it discards the key portion
 // of the address to produce an AbsResource value.
@@ -320,29 +306,13 @@ func (r AbsResourceInstance) DeposedObject(key DeposedKey) AbsResourceInstanceOb
 	}
 }
 
-// TargetContains implements Targetable by returning true if the given other
+// Contains implements Targetable by returning true if the given other
 // address is equal to the receiver.
-func (r AbsResourceInstance) TargetContains(other Targetable) bool {
-	switch to := other.(type) {
-
-	// while we currently don't start with an AbsResourceInstance as a target
-	// address, check all resource types for consistency.
-	case AbsResourceInstance:
-		// We'll use our stringification as a cheat-ish way to test for equality.
-		return to.String() == r.String()
-	case ConfigResource:
-		return to.String() == r.String()
-	case AbsResource:
-		return to.String() == r.String()
-
-	default:
-		return false
-
-	}
-}
-
-func (r AbsResourceInstance) AddrType() TargetableAddrType {
-	return AbsResourceInstanceAddrType
+//
+// An instance key of WildcardKey selects every instance, and so behaves the
+// same as the containing AbsResource.
+func (r AbsResourceInstance) Contains(other Targetable) bool {
+	return targetContains(r, other)
 }
 
 func (r AbsResourceInstance) String() string {
@@ -437,25 +407,11 @@ func (r ConfigResource) Absolute(module ModuleInstance) AbsResource {
 	}
 }
 
-// TargetContains implements Targetable by returning true if the given other
+// Contains implements Targetable by returning true if the given other
 // address is either equal to the receiver or is an instance of the
 // receiver.
-func (r ConfigResource) TargetContains(other Targetable) bool {
-	switch to := other.(type) {
-	case ConfigResource:
-		// We'll use our stringification as a cheat-ish way to test for equality.
-		return to.String() == r.String()
-	case AbsResource:
-		return r.TargetContains(to.Config())
-	case AbsResourceInstance:
-		return r.TargetContains(to.ContainingResource())
-	default:
-		return false
-	}
-}
-
-func (r ConfigResource) AddrType() TargetableAddrType {
-	return ConfigResourceAddrType
+func (r ConfigResource) Contains(other Targetable) bool {
+	return targetContains(r, other)
 }
 
 func (r ConfigResource) String() string {
@@ -511,6 +467,10 @@ const (
 	// EphemeralResourceMode indicates an ephemeral resource, as defined by
 	// "ephemeral" blocks in configuration.
 	EphemeralResourceMode ResourceMode = 'E'
+
+	// ListResourceMode indicates a list resource, as defined by
+	// "list" blocks in tfquery configuration.
+	ListResourceMode ResourceMode = 'L'
 )
 
 // AbsResourceInstanceObject represents one of the specific remote objects

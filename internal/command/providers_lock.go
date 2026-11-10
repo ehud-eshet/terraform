@@ -1,16 +1,16 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command/arguments"
+	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/getproviders"
 	"github.com/hashicorp/terraform/internal/providercache"
@@ -38,43 +38,32 @@ func (c *ProvidersLockCommand) Synopsis() string {
 	return "Write out dependency locks for the configured providers"
 }
 
-func (c *ProvidersLockCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	cmdFlags := c.Meta.defaultFlagSet("providers lock")
-	var optPlatforms arguments.FlagStringSlice
-	var fsMirrorDir string
-	var netMirrorURL string
-
-	cmdFlags.Var(&optPlatforms, "platform", "target platform")
-	cmdFlags.StringVar(&fsMirrorDir, "fs-mirror", "", "filesystem mirror directory")
-	cmdFlags.StringVar(&netMirrorURL, "net-mirror", "", "network mirror base URL")
-	pluginCache := cmdFlags.Bool("enable-plugin-cache", false, "")
-	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
-		return 1
-	}
-
+func (c *ProvidersLockCommand) Run(rawArgs []string) int {
 	var diags tfdiags.Diagnostics
 
-	if fsMirrorDir != "" && netMirrorURL != "" {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"Invalid installation method options",
-			"The -fs-mirror and -net-mirror command line options are mutually-exclusive.",
-		))
-		c.showDiagnostics(diags)
+	// Parse and apply global view arguments
+	common, rawArgs := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
+
+	// Parse command-specific arguments.
+	parsedArgs, parseDiags := arguments.ParseProvidersLock(rawArgs)
+	diags = diags.Append(parseDiags)
+
+	// Prepare the view
+	view := views.NewProvidersLock(parsedArgs.ViewType, c.View)
+
+	// Now the view is ready, process any error diagnostics from parsing arguments.
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	providerStrs := cmdFlags.Args()
-
 	var platforms []getproviders.Platform
-	if len(optPlatforms) == 0 {
+	if len(parsedArgs.Platforms) == 0 {
 		platforms = []getproviders.Platform{getproviders.CurrentPlatform}
 	} else {
-		platforms = make([]getproviders.Platform, 0, len(optPlatforms))
-		for _, platformStr := range optPlatforms {
+		platforms = make([]getproviders.Platform, 0, len(parsedArgs.Platforms))
+		for _, platformStr := range parsedArgs.Platforms {
 			platform, err := getproviders.ParsePlatform(platformStr)
 			if err != nil {
 				diags = diags.Append(tfdiags.Sourceless(
@@ -102,17 +91,17 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 	// against the upstream checksums.
 	var source getproviders.Source
 	switch {
-	case fsMirrorDir != "":
-		source = getproviders.NewFilesystemMirrorSource(fsMirrorDir)
-	case netMirrorURL != "":
-		u, err := url.Parse(netMirrorURL)
+	case parsedArgs.FSMirrorDir != "":
+		source = getproviders.NewFilesystemMirrorSource(parsedArgs.FSMirrorDir)
+	case parsedArgs.NetMirrorURL != "":
+		u, err := url.Parse(parsedArgs.NetMirrorURL)
 		if err != nil || u.Scheme != "https" {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Invalid network mirror URL",
 				"The -net-mirror option requires a valid https: URL as the mirror base URL.",
 			))
-			c.showDiagnostics(diags)
+			view.Diagnostics(diags)
 			return 1
 		}
 		source = getproviders.NewHTTPMirrorSource(u, c.Services.CredentialsSource())
@@ -123,8 +112,35 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 		source = getproviders.NewRegistrySource(c.Services)
 	}
 
-	config, confDiags := c.loadConfig(".")
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(err)
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	var varDiags tfdiags.Diagnostics
+	c.VariableValues, varDiags = parsedArgs.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	diags = diags.Append(varDiags)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	diags = diags.Append(c.resolveConstVariables(".", arguments.ViewHuman))
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	config, confDiags := c.loadConfigWithTests(".", parsedArgs.TestsDirectory)
 	diags = diags.Append(confDiags)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
 	reqs, hclDiags := config.ProviderRequirements()
 	diags = diags.Append(hclDiags)
 
@@ -132,9 +148,9 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 	// we'll modify "reqs" to only include those. Modifying this is okay
 	// because config.ProviderRequirements generates a fresh map result
 	// for each call.
-	if len(providerStrs) != 0 {
+	if len(parsedArgs.Providers) != 0 {
 		providers := map[addrs.Provider]struct{}{}
-		for _, raw := range providerStrs {
+		for _, raw := range parsedArgs.Providers {
 			addr, moreDiags := addrs.ParseProviderSourceString(raw)
 			diags = diags.Append(moreDiags)
 			if moreDiags.HasErrors() {
@@ -174,7 +190,7 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 
 	// If we have any error diagnostics already then we won't proceed further.
 	if diags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -193,7 +209,7 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 	updatedLocks := map[getproviders.Platform]*depsfile.Locks{}
 	selectedVersions := map[addrs.Provider]getproviders.Version{}
 	for _, platform := range platforms {
-		tempDir, err := ioutil.TempDir("", "terraform-providers-lock")
+		tempDir, err := os.MkdirTemp("", "terraform-providers-lock")
 		if err != nil {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
@@ -208,7 +224,7 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 			// Our output from this command is minimal just to show that
 			// we're making progress, rather than just silently hanging.
 			FetchPackageBegin: func(provider addrs.Provider, version getproviders.Version, loc getproviders.PackageLocation) {
-				c.Ui.Output(fmt.Sprintf("- Fetching %s %s for %s...", provider.ForDisplay(), version, platform))
+				view.LogInstallProviderVersionStart(provider, version, platform)
 				if prevVersion, exists := selectedVersions[provider]; exists && version != prevVersion {
 					// This indicates a weird situation where we ended up
 					// selecting a different version for one platform than
@@ -239,9 +255,10 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 					keyID = auth.KeyID
 				}
 				if keyID != "" {
-					keyID = c.Colorize().Color(fmt.Sprintf(", key ID [reset][bold]%s[reset]", keyID))
+					view.LogInstallProviderVersionCompleteWithKeyID(provider, version, platform, auth, keyID)
+				} else {
+					view.LogInstallProviderVersionComplete(provider, version, platform, auth)
 				}
-				c.Ui.Output(fmt.Sprintf("- Retrieved %s %s for %s (%s%s)", provider.ForDisplay(), version, platform, auth, keyID))
 			},
 		}
 		ctx := evts.OnContext(ctx)
@@ -251,7 +268,7 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 
 		// Use global plugin cache for extra speed if present and flag is set
 		globalCacheDir := c.providerGlobalCacheDir()
-		if *pluginCache && globalCacheDir != nil {
+		if parsedArgs.EnablePluginCache && globalCacheDir != nil {
 			installer.SetGlobalCacheDir(globalCacheDir.WithPlatform(platform))
 			installer.SetGlobalCacheDirMayBreakDependencyLockFile(c.PluginCacheMayBreakDependencyLockFile)
 		}
@@ -271,7 +288,7 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 	// If we have any error diagnostics from installation then we won't
 	// proceed to merging and updating the lock file on disk.
 	if diags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -316,24 +333,12 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 			switch providersLockCalculateChangeType(oldLock, platformLock) {
 			case providersLockChangeTypeNewProvider:
 				madeAnyChange = true
-				c.Ui.Output(
-					fmt.Sprintf(
-						"- Obtained %s checksums for %s; This was a new provider and the checksums for this platform are now tracked in the lock file",
-						provider.ForDisplay(),
-						platform))
+				view.ProviderAddedToLockFile(provider, platform)
 			case providersLockChangeTypeNewHashes:
 				madeAnyChange = true
-				c.Ui.Output(
-					fmt.Sprintf(
-						"- Obtained %s checksums for %s; Additional checksums for this platform are now tracked in the lock file",
-						provider.ForDisplay(),
-						platform))
+				view.ProviderChecksumsUpdatedInLockFile(provider, platform)
 			case providersLockChangeTypeNoChange:
-				c.Ui.Output(
-					fmt.Sprintf(
-						"- Obtained %s checksums for %s; All checksums for this platform were already tracked in the lock file",
-						provider.ForDisplay(),
-						platform))
+				view.ProviderUnchangedInLockFile(provider, platform)
 			}
 		}
 		newLocks.SetProvider(provider, version, constraints, hashes)
@@ -342,16 +347,15 @@ func (c *ProvidersLockCommand) Run(args []string) int {
 	moreDiags = c.replaceLockedDependencies(newLocks)
 	diags = diags.Append(moreDiags)
 
-	c.showDiagnostics(diags)
+	view.Diagnostics(diags) // Enable logging of warning diagnostics, if any
 	if diags.HasErrors() {
 		return 1
 	}
 
 	if madeAnyChange {
-		c.Ui.Output(c.Colorize().Color("\n[bold][green]Success![reset] [bold]Terraform has updated the lock file.[reset]"))
-		c.Ui.Output("\nReview the changes in .terraform.lock.hcl and then commit to your\nversion control system to retain the new checksums.\n")
+		view.LogProviderLockfileUpdated()
 	} else {
-		c.Ui.Output(c.Colorize().Color("\n[bold][green]Success![reset] [bold]Terraform has validated the lock file and found no need for changes.[reset]"))
+		view.LockFileValidated()
 	}
 	return 0
 }
@@ -415,7 +419,18 @@ Options:
 
   -enable-plugin-cache   Enable the usage of the globally configured plugin cache.
                          This will speed up the locking process, but the providers
-                         wont be loaded from an authoritative source.
+                         won't be loaded from an authoritative source.
+
+  -test-directory=path   Set the Terraform test directory, defaults to "tests".
+
+  -var 'foo=bar'         Set a value for one of the input variables in the root
+                         module of the configuration. Use this option more than
+                         once to set more than one variable.
+
+  -var-file=filename     Load variable values from the given file, in addition
+                         to the default files terraform.tfvars and *.auto.tfvars.
+                         Use this option more than once to include more than one
+                         variables file.
 `
 }
 

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -23,6 +23,7 @@ var (
 	_ GraphNodeModuleInstance      = (*NodeForgetResourceInstance)(nil)
 	_ GraphNodeConfigResource      = (*NodeForgetResourceInstance)(nil)
 	_ GraphNodeResourceInstance    = (*NodeForgetResourceInstance)(nil)
+	_ GraphNodeReferenceable       = (*NodeForgetResourceInstance)(nil)
 	_ GraphNodeReferencer          = (*NodeForgetResourceInstance)(nil)
 	_ GraphNodeExecutable          = (*NodeForgetResourceInstance)(nil)
 	_ GraphNodeProviderConsumer    = (*NodeForgetResourceInstance)(nil)
@@ -30,20 +31,36 @@ var (
 	_ GraphNodeDestroyer           = (*NodeForgetResourceInstance)(nil)
 )
 
-func (n *NodeForgetResourceInstance) DestroyAddr() *addrs.AbsResourceInstance {
-	return &n.Addr
+func (n *NodeForgetResourceInstance) DestroyAddr() addrs.AbsResourceInstance {
+	return n.Addr
+}
+
+// GraphNodeReferenceable, overriding NodeAbstractResourceInstance
+func (n *NodeForgetResourceInstance) ReferenceableAddrs() []addrs.Referenceable {
+	// Like a destroy node, a forget node is not referenceable. Anything
+	// referring to this resource during a destroy must be evaluated before the
+	// object is removed from state, which is already ordered by the
+	// DestroyEdgeTransformer.
+	return nil
+}
+
+func (n *NodeForgetResourceInstance) References() []*addrs.Reference {
+	// Forgotten resources don't participate in references
+	return nil
 }
 
 func (n *NodeForgetResourceInstance) Name() string {
 	return n.ResourceInstanceAddr().String() + " (forget)"
 }
 
-func (n *NodeForgetResourceInstance) ProvidedBy() (addr addrs.ProviderConfig, exact bool) {
+func (n *NodeForgetResourceInstance) Provider() ProviderRef {
 	if n.Addr.Resource.Resource.Mode == addrs.DataResourceMode {
 		// Indicate that this node does not require a configured provider
-		return nil, true
+		p := n.NodeAbstractResourceInstance.Provider()
+		p.Offline = true
+		return p
 	}
-	return n.NodeAbstractResourceInstance.ProvidedBy()
+	return n.NodeAbstractResourceInstance.Provider()
 }
 
 // GraphNodeExecutable
@@ -58,19 +75,12 @@ func (n *NodeForgetResourceInstance) Execute(ctx EvalContext, op walkOperation) 
 	var changeApply *plans.ResourceInstanceChange
 	var state *states.ResourceInstanceObject
 
-	_, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
-	diags = diags.Append(err)
-	if diags.HasErrors() {
+	changeApply = ctx.Changes().GetResourceInstanceChange(n.Addr, addrs.NotDeposed)
+	if changeApply == nil {
 		return diags
 	}
 
-	changeApply, err = n.readDiff(ctx, providerSchema)
-	diags = diags.Append(err)
-	if changeApply == nil || diags.HasErrors() {
-		return diags
-	}
-
-	state, readDiags := n.readResourceInstanceState(ctx, addr)
+	state, _, readDiags := n.readResourceInstanceState(ctx, addr)
 	diags = diags.Append(readDiags)
 	if diags.HasErrors() {
 		return diags

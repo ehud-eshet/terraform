@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package states
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/go-test/deep"
 	"github.com/google/go-cmp/cmp"
@@ -202,6 +203,13 @@ func TestStateDeepCopy(t *testing.T) {
 			Private:             []byte("private data"),
 			Dependencies:        []addrs.ConfigResource{},
 			CreateBeforeDestroy: true,
+
+			// these may or may not be copied, but should not affect equality of
+			// the resources.
+			decodeValueCache: cty.ObjectVal(map[string]cty.Value{
+				"woozles": cty.StringVal("confuzles"),
+			}),
+			decodeIdentityCache: cty.DynamicVal,
 		},
 		addrs.AbsProviderConfig{
 			Provider: addrs.NewDefaultProvider("test"),
@@ -241,10 +249,33 @@ func TestStateDeepCopy(t *testing.T) {
 	)
 
 	state.EnsureModule(addrs.RootModuleInstance.Child("child", addrs.NoKey))
-
 	stateCopy := state.DeepCopy()
 	if !state.Equal(stateCopy) {
 		t.Fatalf("\nexpected:\n%q\ngot:\n%q\n", state, stateCopy)
+	}
+
+	// this is implied by the above, but has previously used a different
+	// codepath for comparison.
+	if !state.ManagedResourcesEqual(stateCopy) {
+		t.Fatalf("\nexpected managed resources to be equal:\n%q\ngot:\n%q\n", state, stateCopy)
+	}
+
+	// remove the cached values and ensure equality still holds
+	for _, mod := range stateCopy.Modules {
+		for _, res := range mod.Resources {
+			for _, inst := range res.Instances {
+				inst.Current.decodeValueCache = cty.NilVal
+				inst.Current.decodeIdentityCache = cty.NilVal
+			}
+		}
+	}
+
+	if !state.Equal(stateCopy) {
+		t.Fatalf("\nexpected:\n%q\ngot:\n%q\n", state, stateCopy)
+	}
+
+	if !state.ManagedResourcesEqual(stateCopy) {
+		t.Fatalf("\nexpected managed resources to be equal:\n%q\ngot:\n%q\n", state, stateCopy)
 	}
 }
 
@@ -337,6 +368,18 @@ func TestStateHasResourceInstanceObjects(t *testing.T) {
 				s := ss.Lock()
 				delete(s.Modules[""].Resources["test.foo"].Instances, addrs.NoKey)
 				ss.Unlock()
+				done := make(chan struct{})
+				go func() {
+					ss.Lock()
+					ss.Unlock()
+					close(done)
+				}()
+				select {
+				case <-done:
+					// OK: lock was released
+				case <-time.After(500 * time.Millisecond):
+					t.Fatalf("Unlock did not release SyncState lock (timed out acquiring lock again)")
+				}
 			},
 			false,
 		},
@@ -429,6 +472,110 @@ func TestStateHasRootOutputValues(t *testing.T) {
 		})
 	}
 
+}
+
+func TestStateRootOutputValuesEqual(t *testing.T) {
+	tests := map[string]struct {
+		SetupA func(ss *SyncState)
+		SetupB func(ss *SyncState)
+		Want   bool
+	}{
+		"both empty": {
+			func(ss *SyncState) {},
+			func(ss *SyncState) {},
+			true,
+		},
+		"identical outputs": {
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("bar"), false,
+				)
+			},
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("bar"), false,
+				)
+			},
+			true,
+		},
+		"different values same key": {
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("bar"), false,
+				)
+			},
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("baz"), false,
+				)
+			},
+			false,
+		},
+		"different sensitivity same value": {
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("bar"), false,
+				)
+			},
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("bar"), true,
+				)
+			},
+			false,
+		},
+		"different keys same count": {
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("val"), false,
+				)
+			},
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "bar"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("val"), false,
+				)
+			},
+			false,
+		},
+		"different count": {
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("val"), false,
+				)
+			},
+			func(ss *SyncState) {
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("val"), false,
+				)
+				ss.SetOutputValue(
+					addrs.OutputValue{Name: "bar"}.Absolute(addrs.RootModuleInstance),
+					cty.StringVal("val2"), false,
+				)
+			},
+			false,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			stateA := BuildState(test.SetupA)
+			stateB := BuildState(test.SetupB)
+			got := stateA.RootOutputValuesEqual(stateB)
+			if got != test.Want {
+				t.Errorf("wrong result for stateA.RootOutputValuesEqual(stateB)\ngot:  %t\nwant: %t", got, test.Want)
+			}
+		})
+	}
 }
 
 func TestState_MoveAbsResource(t *testing.T) {
@@ -897,124 +1044,68 @@ func TestState_MaybeMoveModuleInstance(t *testing.T) {
 	})
 }
 
-func TestState_MoveModule(t *testing.T) {
-	// For this test, add two module instances (kinder and kinder["a"]).
-	// MoveModule(kinder) should move both instances.
-	state := NewState() // starter state, should be copied by the subtests.
-	srcModule := addrs.RootModule.Child("kinder")
-	m := state.EnsureModule(srcModule.UnkeyedInstanceShim())
-	m.SetResourceInstanceCurrent(
-		addrs.Resource{
-			Mode: addrs.ManagedResourceMode,
-			Type: "test_thing",
-			Name: "foo",
-		}.Instance(addrs.NoKey),
-		&ResourceInstanceObjectSrc{
-			Status:        ObjectReady,
-			SchemaVersion: 1,
-			AttrsJSON:     []byte(`{"woozles":"confuzles"}`),
-		},
-		addrs.AbsProviderConfig{
-			Provider: addrs.NewDefaultProvider("test"),
-			Module:   addrs.RootModule,
-		},
-	)
-
-	moduleInstance := addrs.RootModuleInstance.Child("kinder", addrs.StringKey("a"))
-	mi := state.EnsureModule(moduleInstance)
-	mi.SetResourceInstanceCurrent(
-		addrs.Resource{
-			Mode: addrs.ManagedResourceMode,
-			Type: "test_thing",
-			Name: "foo",
-		}.Instance(addrs.NoKey),
-		&ResourceInstanceObjectSrc{
-			Status:        ObjectReady,
-			SchemaVersion: 1,
-			AttrsJSON:     []byte(`{"woozles":"confuzles"}`),
-		},
-		addrs.AbsProviderConfig{
-			Provider: addrs.NewDefaultProvider("test"),
-			Module:   addrs.RootModule,
-		},
-	)
-
-	_, mc := srcModule.Call()
-	src := mc.Absolute(addrs.RootModuleInstance.Child("kinder", addrs.NoKey))
-
-	t.Run("basic", func(t *testing.T) {
-		s := state.DeepCopy()
-		_, dstMC := addrs.RootModule.Child("child").Call()
-		dst := dstMC.Absolute(addrs.RootModuleInstance.Child("child", addrs.NoKey))
-		s.MoveModule(src, dst)
-
-		// srcModule should have been removed, dstModule should exist and have one resource
-		if len(s.Modules) != 3 { // child, child["a"] and root
-			t.Fatalf("wrong number of modules in state. Expected 3, got %d", len(s.Modules))
-		}
-
-		got := s.Module(dst.Module)
-		if got == nil {
-			t.Fatal("dstModule not found")
-		}
-
-		got = s.Module(addrs.RootModuleInstance.Child("child", addrs.StringKey("a")))
-		if got == nil {
-			t.Fatal("dstModule instance \"a\" not found")
-		}
-
-		gone := s.Module(srcModule.UnkeyedInstanceShim())
-		if gone != nil {
-			t.Fatal("srcModule not removed from state")
-		}
-	})
-
-	t.Run("nested modules", func(t *testing.T) {
-		s := state.DeepCopy()
-
-		// add a child module to module.kinder
-		mi := mustParseModuleInstanceStr(`module.kinder.module.grand[1]`)
-		m := s.EnsureModule(mi)
-		m.SetResourceInstanceCurrent(
-			addrs.Resource{
-				Mode: addrs.ManagedResourceMode,
-				Type: "test_thing",
-				Name: "foo",
-			}.Instance(addrs.NoKey),
-			&ResourceInstanceObjectSrc{
-				Status:        ObjectReady,
-				SchemaVersion: 1,
-				AttrsJSON:     []byte(`{"woozles":"confuzles"}`),
-			},
-			addrs.AbsProviderConfig{
-				Provider: addrs.NewDefaultProvider("test"),
-				Module:   addrs.RootModule,
-			},
-		)
-
-		_, dstMC := addrs.RootModule.Child("child").Call()
-		dst := dstMC.Absolute(addrs.RootModuleInstance.Child("child", addrs.NoKey))
-		s.MoveModule(src, dst)
-
-		moved := s.Module(addrs.RootModuleInstance.Child("child", addrs.StringKey("a")))
-		if moved == nil {
-			t.Fatal("dstModule not found")
-		}
-
-		// The nested module's relative address should also have been updated
-		nested := s.Module(mustParseModuleInstanceStr(`module.child.module.grand[1]`))
-		if nested == nil {
-			t.Fatal("nested child module of src wasn't moved")
-		}
-	})
-}
-
-func mustParseModuleInstanceStr(str string) addrs.ModuleInstance {
-	addr, diags := addrs.ParseModuleInstanceStr(str)
-	if diags.HasErrors() {
-		panic(diags.Err())
+func TestState_ProviderAddrs(t *testing.T) {
+	// 1) nil state
+	var nilState *State
+	if got := nilState.ProviderAddrs(); got != nil {
+		t.Fatalf("nil state: expected nil, got %#v", got)
 	}
-	return addr
+
+	// 2) empty state
+	empty := NewState()
+	if got := empty.ProviderAddrs(); got != nil {
+		t.Fatalf("empty state: expected nil, got %#v", got)
+	}
+
+	// 3) populated state
+	s := NewState()
+
+	rootAWS := addrs.AbsProviderConfig{
+		Module:   addrs.RootModule,
+		Provider: addrs.NewDefaultProvider("aws"),
+	}
+	rootGoogle := addrs.AbsProviderConfig{
+		Module:   addrs.RootModule,
+		Provider: addrs.NewDefaultProvider("google"),
+	}
+	childAWS := addrs.AbsProviderConfig{
+		Module:   addrs.RootModule.Child("child"),
+		Provider: addrs.NewDefaultProvider("aws"),
+	}
+
+	rm := s.RootModule()
+	rm.SetResourceInstanceCurrent(
+		addrs.Resource{Mode: addrs.ManagedResourceMode, Type: "test_thing", Name: "foo"}.Instance(addrs.NoKey),
+		&ResourceInstanceObjectSrc{Status: ObjectReady, SchemaVersion: 1, AttrsJSON: []byte(`{}`)},
+		rootAWS,
+	)
+
+	rm.SetResourceInstanceCurrent(
+		addrs.Resource{Mode: addrs.ManagedResourceMode, Type: "test_thing", Name: "bar"}.Instance(addrs.NoKey),
+		&ResourceInstanceObjectSrc{Status: ObjectReady, SchemaVersion: 1, AttrsJSON: []byte(`{}`)},
+		rootAWS,
+	)
+
+	rm.SetResourceInstanceCurrent(
+		addrs.Resource{Mode: addrs.ManagedResourceMode, Type: "test_thing", Name: "baz"}.Instance(addrs.NoKey),
+		&ResourceInstanceObjectSrc{Status: ObjectReady, SchemaVersion: 1, AttrsJSON: []byte(`{}`)},
+		rootGoogle,
+	)
+
+	childMI := addrs.RootModuleInstance.Child("child", addrs.NoKey)
+	cm := s.EnsureModule(childMI)
+	cm.SetResourceInstanceCurrent(
+		addrs.Resource{Mode: addrs.ManagedResourceMode, Type: "test_thing", Name: "child"}.Instance(addrs.NoKey),
+		&ResourceInstanceObjectSrc{Status: ObjectReady, SchemaVersion: 1, AttrsJSON: []byte(`{}`)},
+		childAWS,
+	)
+
+	got := s.ProviderAddrs()
+	expected := []addrs.AbsProviderConfig{childAWS, rootAWS, rootGoogle}
+
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("unexpected provider addrs\nexpected: %#v\ngot: %#v", expected, got)
+	}
 }
 
 func mustAbsResourceAddr(s string) addrs.AbsResource {

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package objchange
@@ -73,12 +73,6 @@ func PlannedDataResourceObject(schema *configschema.Block, config cty.Value) cty
 
 func proposedNew(schema *configschema.Block, prior, config cty.Value) cty.Value {
 	if config.IsNull() || !config.IsKnown() {
-		// A block config should never be null at this point. The only nullable
-		// block type is NestingSingle, which will return early before coming
-		// back here. We'll allow the null here anyway to free callers from
-		// needing to specifically check for these cases, and any mismatch will
-		// be caught in validation, so just take the prior value rather than
-		// the invalid null.
 		return prior
 	}
 
@@ -229,7 +223,6 @@ func proposedNewNestingList(schema nestedSchema, prior, config cty.Value) cty.Va
 
 func proposedNewNestingMap(schema nestedSchema, prior, config cty.Value) cty.Value {
 	newV := config
-
 	newVals := map[string]cty.Value{}
 
 	if config.IsNull() || !config.IsKnown() || config.LengthInt() == 0 {
@@ -239,7 +232,7 @@ func proposedNewNestingMap(schema nestedSchema, prior, config cty.Value) cty.Val
 	}
 	cfgMap := config.AsValueMap()
 
-	// prior may be null or empty
+	// prior may be null, empty or unknown
 	priorMap := map[string]cty.Value{}
 	if !prior.IsNull() && prior.IsKnown() && prior.LengthInt() > 0 {
 		priorMap = prior.AsValueMap()
@@ -248,10 +241,13 @@ func proposedNewNestingMap(schema nestedSchema, prior, config cty.Value) cty.Val
 	for name, configEV := range cfgMap {
 		priorEV, inPrior := priorMap[name]
 		if !inPrior {
-			// If there is no corresponding prior element then
-			// we just take the config value as-is.
-			newVals[name] = configEV
-			continue
+			// if the prior cty.Map value was unknown the map won't have any
+			// keys, so generate an unknown value.
+			if !prior.IsKnown() {
+				priorEV = cty.UnknownVal(configEV.Type())
+			} else {
+				priorEV = cty.NullVal(configEV.Type())
+			}
 		}
 
 		newVals[name] = proposedNewBlockOrObject(schema, priorEV, configEV)
@@ -334,14 +330,16 @@ func proposedNewAttributes(attrs map[string]*configschema.Attribute, prior, conf
 	newAttrs := make(map[string]cty.Value, len(attrs))
 	for name, attr := range attrs {
 		var priorV cty.Value
-		if prior.IsNull() {
+
+		switch {
+		case prior.IsNull():
 			priorV = cty.NullVal(prior.Type().AttributeType(name))
-		} else {
+		case !prior.IsKnown():
+			priorV = cty.UnknownVal(prior.Type().AttributeType(name))
+		default:
 			priorV = prior.GetAttr(name)
 		}
-
 		configV := config.GetAttr(name)
-
 		var newV cty.Value
 		switch {
 		// required isn't considered when constructing the plan, so attributes
@@ -491,4 +489,46 @@ func validPriorFromConfig(schema nestedSchema, prior, config cty.Value) bool {
 	})
 
 	return valid
+}
+
+// PrepareComputedBlock walks over the given plan value, and converts empty
+// computed block values to null in order to indicate to the provider that it
+// can insert its own computed value. The val argument must conform to the
+// schema type, and must be entirely unmarked.
+func PrepareComputedBlocks(schema *configschema.Block, val cty.Value) cty.Value {
+	if !schema.ContainsComputedBlocks() {
+		// fast path so we don't need to transform the value
+		return val
+	}
+
+	val, _ = cty.Transform(val, func(p cty.Path, v cty.Value) (cty.Value, error) {
+		if !v.IsKnown() || v.IsNull() {
+			// an unknown value must have some configuration no matter the type,
+			// and a null is already null
+			return v, nil
+		}
+
+		nestedBlock := schema.NestedBlockByPath(p)
+		if nestedBlock == nil || !nestedBlock.Computed {
+			// either not a block, or not computed, doesn't matter, nothing to change
+			return v, nil
+		}
+
+		switch nestedBlock.Nesting {
+		case configschema.NestingSingle, configschema.NestingGroup:
+			// NestingSingle is the only block type which can natively be null,
+			// so there's no transformation to do. NestingGroup can't be
+			// computed, so should not have reached this point anyway.
+			return v, nil
+		}
+
+		// Any other known block value type must have a length.
+		if v.LengthInt() == 0 {
+			v = cty.NullVal(v.Type())
+		}
+
+		return v, nil
+	})
+
+	return val
 }

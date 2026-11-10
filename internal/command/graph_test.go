@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -10,10 +10,12 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/hashicorp/cli"
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/backend"
+	backendInit "github.com/hashicorp/terraform/internal/backend/init"
+	"github.com/hashicorp/terraform/internal/command/workdir"
 	"github.com/hashicorp/terraform/internal/configs/configload"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/initwd"
@@ -21,39 +23,37 @@ import (
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/registry"
 	"github.com/hashicorp/terraform/internal/states"
-	"github.com/hashicorp/terraform/internal/terminal"
 )
 
 func TestGraph_planPhase(t *testing.T) {
+	t.Parallel() // possible because t.Chdir not needed
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("graph"), td)
-	defer testChdir(t, td)()
 
-	ui := new(cli.MockUi)
-	streams, closeStreams := terminal.StreamsForTesting(t)
+	view, done := testView(t)
 	c := &GraphCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(applyFixtureProvider()),
-			Ui:               ui,
-			Streams:          streams,
+			View:             view,
+			WorkingDir:       workdir.NewDir(td),
 		},
 	}
 
 	args := []string{"-type=plan"}
 	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+		t.Fatalf("bad: \n%s", done(t).Stderr())
 	}
 
-	output := closeStreams(t)
+	output := done(t)
 	if !strings.Contains(output.Stdout(), `provider[\"registry.terraform.io/hashicorp/test\"]`) {
 		t.Fatalf("doesn't look like digraph:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
 	}
 }
 
 func TestGraph_cyclic(t *testing.T) {
+	t.Parallel() // possible because t.Chdir not needed
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("graph-cyclic"), td)
-	defer testChdir(t, td)()
 
 	tests := []struct {
 		name     string
@@ -68,8 +68,10 @@ func TestGraph_cyclic(t *testing.T) {
 		{
 			name: "plan",
 			args: []string{"-type=plan"},
-			errors: []string{`Error: Cycle: test_instance.`,
-				`Error: Cycle: local.`},
+			errors: []string{
+				"Error: Cycle:\n  test_instance.",
+				"Error: Cycle:\n  local.",
+			},
 		},
 		{
 			name: "plan with -draw-cycles option",
@@ -100,8 +102,10 @@ func TestGraph_cyclic(t *testing.T) {
 			// The cyclic errors do not maintain a consistent order, so we can't
 			// predict the exact output. We'll just check that the error messages
 			// are present for the things we know are cyclic.
-			errors: []string{`Error: Cycle: test_instance.`,
-				`Error: Cycle: local.`},
+			errors: []string{
+				"Error: Cycle:\n  test_instance.",
+				"Error: Cycle:\n  local.",
+			},
 		},
 		{
 			name: "apply with -draw-cycles option",
@@ -130,23 +134,23 @@ func TestGraph_cyclic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ui := new(cli.MockUi)
-			streams, closeStreams := terminal.StreamsForTesting(t)
+			view, done := testView(t)
 			c := &GraphCommand{
 				Meta: Meta{
 					testingOverrides: metaOverridesForProvider(applyFixtureProvider()),
-					Ui:               ui,
-					Streams:          streams,
+					View:             view,
+					WorkingDir:       workdir.NewDir(td),
 				},
 			}
 
-			code := c.Run(tt.args)
+			args := append([]string{"-no-color"}, tt.args...)
+			code := c.Run(args)
 			// If we expect errors, make sure they are present
 			if len(tt.errors) > 0 {
 				if code == 0 {
 					t.Fatalf("expected error, got none")
 				}
-				got := strings.TrimSpace(ui.ErrorWriter.String())
+				got := strings.TrimSpace(done(t).Stderr())
 				for _, err := range tt.errors {
 					if !strings.Contains(got, err) {
 						t.Fatalf("expected error:\n%s\n\nactual error:\n%s", err, got)
@@ -157,23 +161,22 @@ func TestGraph_cyclic(t *testing.T) {
 
 			// If we don't expect errors, make sure the command ran successfully
 			if code != 0 {
-				t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+				t.Fatalf("bad: \n%s", done(t).Stderr())
 			}
-			output := closeStreams(t)
+			output := done(t)
 			if strings.TrimSpace(output.Stdout()) != strings.TrimSpace(tt.expected) {
 				t.Fatalf("expected dot graph to match:\n%s", cmp.Diff(output.Stdout(), tt.expected))
 			}
-
 		})
 	}
 }
 
 func TestGraph_multipleArgs(t *testing.T) {
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &GraphCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(applyFixtureProvider()),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
@@ -182,23 +185,22 @@ func TestGraph_multipleArgs(t *testing.T) {
 		"bad",
 	}
 	if code := c.Run(args); code != 1 {
-		t.Fatalf("bad: \n%s", ui.OutputWriter.String())
+		t.Fatalf("bad: \n%s", done(t).Stderr())
 	}
 }
 
 func TestGraph_noConfig(t *testing.T) {
+	t.Parallel() // possible because t.Chdir not needed
+
 	td := t.TempDir()
 	os.MkdirAll(td, 0755)
-	defer testChdir(t, td)()
 
-	streams, closeStreams := terminal.StreamsForTesting(t)
-	defer closeStreams(t)
-	ui := cli.NewMockUi()
+	view, done := testView(t)
 	c := &GraphCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(applyFixtureProvider()),
-			Ui:               ui,
-			Streams:          streams,
+			View:             view,
+			WorkingDir:       workdir.NewDir(td),
 		},
 	}
 
@@ -206,13 +208,14 @@ func TestGraph_noConfig(t *testing.T) {
 	// but this may be an error at some point in the future.
 	args := []string{"-type", "apply"}
 	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+		t.Fatalf("bad: \n%s", done(t).Stderr())
 	}
 }
 
 func TestGraph_resourcesOnly(t *testing.T) {
 	wd := tempWorkingDirFixture(t, "graph-interesting")
-	defer testChdir(t, wd.RootModuleDir())()
+	td := wd.RootModuleDir()
+	t.Chdir(td)
 
 	// The graph-interesting fixture has a child module, so we'll need to
 	// run the module installer just to get the working directory set up
@@ -224,8 +227,8 @@ func TestGraph_resourcesOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := initwd.NewModuleInstaller(".terraform/modules", loader, registry.NewClient(nil, nil))
-	_, instDiags := inst.InstallModules(context.Background(), ".", "tests", true, false, initwd.ModuleInstallHooksImpl{})
+	inst := initwd.NewModuleInstaller(".terraform/modules", loader, registry.NewClient(nil, nil), testModuleInstallerInitializer(loader))
+	_, instDiags := inst.InstallModules(context.Background(), ".", "tests", true, false)
 	if instDiags.HasErrors() {
 		t.Fatal(instDiags.Err())
 	}
@@ -246,8 +249,7 @@ func TestGraph_resourcesOnly(t *testing.T) {
 		},
 	}
 
-	ui := cli.NewMockUi()
-	streams, closeStreams := terminal.StreamsForTesting(t)
+	view, done := testView(t)
 	c := &GraphCommand{
 		Meta: Meta{
 			testingOverrides: &testingOverrides{
@@ -255,20 +257,18 @@ func TestGraph_resourcesOnly(t *testing.T) {
 					addrs.NewDefaultProvider("foo"): providers.FactoryFixed(p),
 				},
 			},
-			Ui:      ui,
-			Streams: streams,
+			View:       view,
+			WorkingDir: workdir.NewDir(td),
 		},
 	}
 
 	// A "resources only" graph is the default behavior, with no extra arguments.
 	args := []string{}
 	if code := c.Run(args); code != 0 {
-		output := closeStreams(t)
-		t.Fatalf("unexpected error: \n%s", output.Stderr())
+		t.Fatalf("unexpected error: \n%s", done(t).Stderr())
 	}
 
-	output := closeStreams(t)
-	gotGraph := strings.TrimSpace(output.Stdout())
+	gotGraph := strings.TrimSpace(done(t).Stdout())
 	wantGraph := strings.TrimSpace(`
 digraph G {
   rankdir = "RL";
@@ -292,7 +292,8 @@ digraph G {
 }
 
 func TestGraph_applyPhaseSavedPlan(t *testing.T) {
-	testCwd(t)
+	tmp := t.TempDir()
+	t.Chdir(tmp)
 
 	emptyObj, err := plans.NewDynamicValue(cty.EmptyObjectVal, cty.EmptyObject)
 	if err != nil {
@@ -324,24 +325,24 @@ func TestGraph_applyPhaseSavedPlan(t *testing.T) {
 		},
 	})
 
-	plan.Backend = plans.Backend{
+	plan.Backend = &plans.Backend{
 		// Doesn't actually matter since we aren't going to activate the backend
 		// for this command anyway, but we need something here for the plan
 		// file writer to succeed.
-		Type:   "placeholder",
-		Config: emptyObj,
+		Type:      "placeholder",
+		Config:    emptyObj,
+		Workspace: "default",
 	}
 	_, configSnap := testModuleWithSnapshot(t, "graph")
 
 	planPath := testPlanFile(t, configSnap, states.NewState(), plan)
 
-	streams, closeStreams := terminal.StreamsForTesting(t)
-	ui := cli.NewMockUi()
+	view, done := testView(t)
 	c := &GraphCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(applyFixtureProvider()),
-			Ui:               ui,
-			Streams:          streams,
+			View:             view,
+			WorkingDir:       workdir.NewDir(tmp),
 		},
 	}
 
@@ -349,11 +350,104 @@ func TestGraph_applyPhaseSavedPlan(t *testing.T) {
 		"-plan", planPath,
 	}
 	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+		t.Fatalf("bad: \n%s", done(t).Stderr())
 	}
 
-	output := closeStreams(t)
+	output := done(t)
 	if !strings.Contains(output.Stdout(), `provider[\"registry.terraform.io/hashicorp/test\"]`) {
 		t.Fatalf("doesn't look like digraph:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
 	}
+}
+
+func TestGraph_constVariable(t *testing.T) {
+	t.Run("missing value", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var")
+		// t.Chdir not needed
+
+		view, done := testView(t)
+		c := &GraphCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				View:             view,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{}
+		if code := c.Run(args); code != 1 {
+			output := done(t)
+			t.Fatalf("expected exit status 1\nstdout:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
+		}
+
+		output := done(t)
+		if !strings.Contains(output.Stderr(), "No value for required variable") {
+			t.Fatalf("expected missing variable error, got:\n%s", output.Stderr())
+		}
+	})
+
+	t.Run("value via cli", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var")
+		t.Chdir(wd.RootModuleDir())
+
+		view, done := testView(t)
+		c := &GraphCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				View:             view,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{"-var", "module_name=child"}
+		if code := c.Run(args); code != 0 {
+			output := done(t)
+			t.Fatalf("bad:\nstdout:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
+		}
+
+		output := done(t)
+		wantOutput := []string{
+			`"module.child.test_instance.test" [label="test_instance.test"]`,
+		}
+		for _, want := range wantOutput {
+			if !strings.Contains(output.Stdout(), want) {
+				t.Fatalf("output missing %s:\n%s", want, output.Stdout())
+			}
+		}
+	})
+
+	t.Run("value via backend", func(t *testing.T) {
+		mockBackend := TestNewVariableBackend(map[string]string{
+			"module_name": "child",
+		})
+		backendInit.Set("local-vars", func() backend.Backend { return mockBackend })
+		defer backendInit.Set("local-vars", nil)
+
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/command-with-const-var-backend")
+		t.Chdir(wd.RootModuleDir())
+
+		view, done := testView(t)
+		c := &GraphCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				View:             view,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{}
+		if code := c.Run(args); code != 0 {
+			output := done(t)
+			t.Fatalf("bad:\nstdout:\n%s\n\nstderr:\n%s", output.Stdout(), output.Stderr())
+		}
+
+		output := done(t)
+		wantOutput := []string{
+			`"module.child.test_instance.test" [label="test_instance.test"]`,
+		}
+		for _, want := range wantOutput {
+			if !strings.Contains(output.Stdout(), want) {
+				t.Fatalf("output missing %s:\n%s", want, output.Stdout())
+			}
+		}
+	})
 }

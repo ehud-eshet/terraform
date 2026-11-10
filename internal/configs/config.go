@@ -1,14 +1,18 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package configs
 
 import (
 	"fmt"
+	"iter"
 	"log"
+	"maps"
+	"slices"
 	"sort"
+	"strings"
 
-	version "github.com/hashicorp/go-version"
+	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
 
 	"github.com/hashicorp/terraform/internal/addrs"
@@ -83,6 +87,13 @@ type Config struct {
 	// This field is meaningless for the root module, where it will always
 	// be nil.
 	Version *version.Version
+
+	// VersionConstraint is the version constraint that was specified for this module.
+	// This field is nil if no version constraint was specified.
+	//
+	// This field is meaningless for the root module, where it will always
+	// be nil.
+	VersionConstraint VersionConstraint
 }
 
 // ModuleRequirements represents the provider requirements for an individual
@@ -135,25 +146,24 @@ func (c *Config) Depth() int {
 func (c *Config) DeepEach(cb func(c *Config)) {
 	cb(c)
 
-	names := make([]string, 0, len(c.Children))
-	for name := range c.Children {
-		names = append(names, name)
-	}
-
-	for _, name := range names {
-		c.Children[name].DeepEach(cb)
+	for _, ch := range c.Children {
+		ch.DeepEach(cb)
 	}
 }
 
-// AllModules returns a slice of all the receiver and all of its descendant
-// nodes in the module tree, in the same order they would be visited by
-// DeepEach.
-func (c *Config) AllModules() []*Config {
-	var ret []*Config
-	c.DeepEach(func(c *Config) {
-		ret = append(ret, c)
-	})
-	return ret
+// AllModules returns an iterator of all the receiver and all of its descendant
+// nodes in the module tree until the iterator is exhausted or terminated.
+func (c *Config) AllModules() iter.Seq[*Config] {
+	return func(yield func(*Config) bool) {
+		if !yield(c) {
+			return
+		}
+		for _, ch := range c.Children {
+			if !yield(ch) {
+				return
+			}
+		}
+	}
 }
 
 // Descendant returns the descendant config that has the given path beneath
@@ -195,57 +205,20 @@ func (c *Config) DescendantForInstance(path addrs.ModuleInstance) *Config {
 // within the configuration.
 //
 // This doesn't consider instance expansion, so we're only making sure the
-// target could exist if the instance expansion expands correctly.
-func (c *Config) TargetExists(target addrs.Targetable) bool {
-	switch target.AddrType() {
-	case addrs.ConfigResourceAddrType:
-		addr := target.(addrs.ConfigResource)
+// configuration declares the object whose instances the target selects.
+func (c *Config) TargetExists(target addrs.TargetPattern) bool {
+	switch addr := target.ConfigAddr().(type) {
+	case addrs.Module:
+		return c.Descendant(addr) != nil
+	case addrs.ConfigResource:
 		module := c.Descendant(addr.Module)
-		if module != nil {
-			return module.Module.ResourceByAddr(addr.Resource) != nil
-		} else {
-			return false
-		}
-	case addrs.AbsResourceInstanceAddrType:
-		addr := target.(addrs.AbsResourceInstance)
-		module := c.DescendantForInstance(addr.Module)
-		if module != nil {
-			return module.Module.ResourceByAddr(addr.Resource.Resource) != nil
-		} else {
-			return false
-		}
-	case addrs.AbsResourceAddrType:
-		addr := target.(addrs.AbsResource)
-		module := c.DescendantForInstance(addr.Module)
-		if module != nil {
-			return module.Module.ResourceByAddr(addr.Resource) != nil
-		} else {
-			return false
-		}
-	case addrs.ModuleAddrType:
-		return c.Descendant(target.(addrs.Module)) != nil
-	case addrs.ModuleInstanceAddrType:
-		return c.DescendantForInstance(target.(addrs.ModuleInstance)) != nil
+		return module != nil && module.Module.ResourceByAddr(addr.Resource) != nil
+	case addrs.ConfigAction:
+		module := c.Descendant(addr.Module)
+		return module != nil && module.Module.Actions[addr.Action.String()] != nil
 	default:
-		panic(fmt.Errorf("unrecognized targetable type: %d", target.AddrType()))
+		panic(fmt.Sprintf("unrecognized target %s", target))
 	}
-}
-
-// EntersNewPackage returns true if this call is to an external module, either
-// directly via a remote source address or indirectly via a registry source
-// address.
-//
-// Other behaviors in Terraform may treat package crossings as a special
-// situation, because that indicates that the caller and callee can change
-// independently of one another and thus we should disallow using any features
-// where the caller assumes anything about the callee other than its input
-// variables, required provider configurations, and output values.
-//
-// It's not meaningful to ask if the Config representing the root module enters
-// a new package because the root module is always outside of all module
-// packages, and so this function will arbitrarily return false in that case.
-func (c *Config) EntersNewPackage() bool {
-	return moduleSourceAddrEntersNewPackage(c.SourceAddr)
 }
 
 // VerifyDependencySelections checks whether the given locked dependencies
@@ -341,7 +314,7 @@ func (c *Config) VerifyDependencySelections(depLocks *depsfile.Locks) []error {
 // may be incomplete.
 func (c *Config) ProviderRequirements() (providerreqs.Requirements, hcl.Diagnostics) {
 	reqs := make(providerreqs.Requirements)
-	diags := c.addProviderRequirements(reqs, true, true)
+	diags := c.AddProviderRequirements(reqs, true, true)
 
 	return reqs, diags
 }
@@ -350,7 +323,7 @@ func (c *Config) ProviderRequirements() (providerreqs.Requirements, hcl.Diagnost
 // files for all providers. This function does not consider any test files.
 func (c *Config) ProviderRequirementsConfigOnly() (providerreqs.Requirements, hcl.Diagnostics) {
 	reqs := make(providerreqs.Requirements)
-	diags := c.addProviderRequirements(reqs, true, false)
+	diags := c.AddProviderRequirements(reqs, true, false)
 
 	return reqs, diags
 }
@@ -362,7 +335,7 @@ func (c *Config) ProviderRequirementsConfigOnly() (providerreqs.Requirements, hc
 // may be incomplete.
 func (c *Config) ProviderRequirementsShallow() (providerreqs.Requirements, hcl.Diagnostics) {
 	reqs := make(providerreqs.Requirements)
-	diags := c.addProviderRequirements(reqs, false, true)
+	diags := c.AddProviderRequirements(reqs, false, true)
 
 	return reqs, diags
 }
@@ -375,7 +348,7 @@ func (c *Config) ProviderRequirementsShallow() (providerreqs.Requirements, hcl.D
 // may be incomplete.
 func (c *Config) ProviderRequirementsByModule() (*ModuleRequirements, hcl.Diagnostics) {
 	reqs := make(providerreqs.Requirements)
-	diags := c.addProviderRequirements(reqs, false, false)
+	diags := c.AddProviderRequirements(reqs, false, false)
 
 	children := make(map[string]*ModuleRequirements)
 	for name, child := range c.Children {
@@ -417,11 +390,11 @@ func (c *Config) ProviderRequirementsByModule() (*ModuleRequirements, hcl.Diagno
 	return ret, diags
 }
 
-// addProviderRequirements is the main part of the ProviderRequirements
+// AddProviderRequirements is the main part of the ProviderRequirements
 // implementation, gradually mutating a shared requirements object to
 // eventually return. If the recurse argument is true, the requirements will
 // include all descendant modules; otherwise, only the specified module.
-func (c *Config) addProviderRequirements(reqs providerreqs.Requirements, recurse, tests bool) hcl.Diagnostics {
+func (c *Config) AddProviderRequirements(reqs providerreqs.Requirements, recurse, tests bool) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	// First we'll deal with the requirements directly in _our_ module...
@@ -477,6 +450,15 @@ func (c *Config) addProviderRequirements(reqs providerreqs.Requirements, recurse
 	}
 
 	for _, rc := range c.Module.EphemeralResources {
+		fqn := rc.Provider
+		if _, exists := reqs[fqn]; exists {
+			// Explicit dependency already present
+			continue
+		}
+		reqs[fqn] = nil
+	}
+
+	for _, rc := range c.Module.Actions {
 		fqn := rc.Provider
 		if _, exists := reqs[fqn]; exists {
 			// Explicit dependency already present
@@ -575,7 +557,7 @@ func (c *Config) addProviderRequirements(reqs providerreqs.Requirements, recurse
 			// Then we'll also look for requirements in testing modules.
 			for _, run := range file.Runs {
 				if run.ConfigUnderTest != nil {
-					moreDiags := run.ConfigUnderTest.addProviderRequirements(reqs, true, false)
+					moreDiags := run.ConfigUnderTest.AddProviderRequirements(reqs, true, false)
 					diags = append(diags, moreDiags...)
 				}
 			}
@@ -584,7 +566,7 @@ func (c *Config) addProviderRequirements(reqs providerreqs.Requirements, recurse
 
 	if recurse {
 		for _, childConfig := range c.Children {
-			moreDiags := childConfig.addProviderRequirements(reqs, true, false)
+			moreDiags := childConfig.AddProviderRequirements(reqs, true, false)
 			diags = append(diags, moreDiags...)
 		}
 	}
@@ -626,13 +608,21 @@ func (c *Config) addProviderRequirementsFromProviderBlock(reqs providerreqs.Requ
 	return diags
 }
 
-// resolveProviderTypes walks through the providers in the module and ensures
+// ResolveProviderTypes walks through the providers in the module and ensures
 // the true types are assigned based on the provider requirements for the
 // module.
-func (c *Config) resolveProviderTypes() map[string]addrs.Provider {
+func (c *Config) ResolveProviderTypes() map[string]addrs.Provider {
 	for _, child := range c.Children {
-		child.resolveProviderTypes()
+		child.ResolveProviderTypes()
 	}
+
+	// Resolve provider metas
+	metas := make(map[addrs.Provider]*ProviderMeta, len(c.Module.ProviderMetaConfigs))
+	for _, pm := range c.Module.ProviderMetaConfigs {
+		provider := c.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{LocalName: pm.Provider})
+		metas[provider] = pm
+	}
+	c.Module.ProviderMetas = metas
 
 	// collect the required_providers, and then add any missing default providers
 	providers := map[string]addrs.Provider{}
@@ -672,13 +662,95 @@ func (c *Config) resolveProviderTypes() map[string]addrs.Provider {
 		}
 	}
 
+	// Add provider name resolution
+	assignResourceProviders := func(resources map[string]*Resource) {
+		for _, r := range resources {
+			// set the provider FQN for the resource
+			if r.ProviderConfigRef != nil {
+				r.Provider = c.Module.ProviderForLocalConfig(r.ProviderConfigAddr())
+			} else {
+				// an invalid resource name (for e.g. "null resource" instead of
+				// "null_resource") can cause a panic down the line in addrs:
+				// https://github.com/hashicorp/terraform/issues/25560
+				implied, err := addrs.ParseProviderPart(r.Addr().ImpliedProvider())
+				if err == nil {
+					r.Provider = c.Module.ImpliedProviderForUnqualifiedType(implied)
+				}
+				// We don't return a diagnostic because the invalid resource name
+				// will already have been caught.
+			}
+		}
+	}
+
+	assignActionProviders := func(actions map[string]*Action) {
+		for _, a := range actions {
+			// set the provider FQN for the action
+			if a.ProviderConfigRef != nil {
+				a.Provider = c.Module.ProviderForLocalConfig(a.ProviderConfigAddr())
+			} else {
+				implied, err := addrs.ParseProviderPart(a.Addr().ImpliedProvider())
+				if err == nil {
+					a.Provider = c.Module.ImpliedProviderForUnqualifiedType(implied)
+				}
+				// We don't return a diagnostic because the invalid resource name
+				// will already have been caught.
+			}
+		}
+	}
+
+	assignImportProviders := func(imports []*Import) {
+		for _, i := range imports {
+			// set the provider FQN for an import
+			if i.ProviderConfigRef != nil {
+				i.Provider = c.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{
+					LocalName: i.ProviderConfigRef.Name,
+					Alias:     i.ProviderConfigRef.Alias,
+				})
+			} else {
+				implied, err := addrs.ParseProviderPart(i.ToResource.Resource.ImpliedProvider())
+				if err == nil {
+					i.Provider = c.Module.ImpliedProviderForUnqualifiedType(implied)
+				}
+				// We don't return a diagnostic because the invalid resource name
+				// will already have been caught.
+			}
+		}
+	}
+
+	assignResourceProviders(c.Module.ManagedResources)
+	assignResourceProviders(c.Module.DataResources)
+	assignResourceProviders(c.Module.EphemeralResources)
+	assignResourceProviders(c.Module.ListResources)
+	assignActionProviders(c.Module.Actions)
+	assignImportProviders(c.Module.Import)
+
 	return providers
 }
 
-// resolveProviderTypesForTests matches resolveProviderTypes except it uses
-// the information from resolveProviderTypes to resolve the provider types for
+// ResolveStateStoreProviderType gets tfaddr.Provider data for the provider used for pluggable state storage
+// and assigns it to the ProviderAddr field in the config's root module's state store data.
+//
+// See the reused function ResolveStateStoreProviderType for details about logic.
+// If no match is found, an error diagnostic is returned.
+func (c *Config) ResolveStateStoreProviderType() hcl.Diagnostics {
+	var diags hcl.Diagnostics
+
+	providerType, typeDiags := resolveStateStoreProviderType(c.Root.Module.ProviderRequirements.RequiredProviders,
+		*c.Root.Module.StateStore)
+
+	if typeDiags.HasErrors() {
+		diags = append(diags, typeDiags...)
+		return diags
+	}
+
+	c.Root.Module.StateStore.ProviderAddr = providerType
+	return nil
+}
+
+// ResolveProviderTypesForTests matches ResolveProviderTypes except it uses
+// the information from ResolveProviderTypes to resolve the provider types for
 // providers defined within the configs test files.
-func (c *Config) resolveProviderTypesForTests(providers map[string]addrs.Provider) {
+func (c *Config) ResolveProviderTypesForTests(providers map[string]addrs.Provider) {
 
 	for _, test := range c.Module.Tests {
 
@@ -717,7 +789,7 @@ func (c *Config) resolveProviderTypesForTests(providers map[string]addrs.Provide
 			// types for that first, and then use those providers.
 			providers := providers
 			if run.ConfigUnderTest != nil {
-				providers = run.ConfigUnderTest.resolveProviderTypes()
+				providers = run.ConfigUnderTest.ResolveProviderTypes()
 			}
 
 			// We now check to see what providers this run block is actually
@@ -826,12 +898,8 @@ func (c *Config) ProviderTypes() []addrs.Provider {
 	// Ignore diagnostics here because they relate to version constraints
 	reqs, _ := c.ProviderRequirements()
 
-	ret := make([]addrs.Provider, 0, len(reqs))
-	for k := range reqs {
-		ret = append(ret, k)
-	}
-	sort.Slice(ret, func(i, j int) bool {
-		return ret[i].String() < ret[j].String()
+	ret := slices.SortedFunc(maps.Keys(reqs), func(i, j addrs.Provider) int {
+		return strings.Compare(i.String(), j.String())
 	})
 	return ret
 }
@@ -1006,6 +1074,12 @@ func (c *Config) EffectiveRequiredProviderConfigs() addrs.Map[addrs.RootProvider
 		maybePutLocal(rc.ProviderConfigAddr(), false)
 	}
 	for _, rc := range c.Module.DataResources {
+		maybePutLocal(rc.ProviderConfigAddr(), false)
+	}
+	for _, rc := range c.Module.Actions {
+		maybePutLocal(rc.ProviderConfigAddr(), false)
+	}
+	for _, rc := range c.Module.EphemeralResources {
 		maybePutLocal(rc.ProviderConfigAddr(), false)
 	}
 	for _, ic := range c.Module.Import {

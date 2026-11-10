@@ -1,18 +1,19 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
 
 import (
+	"bytes"
 	"encoding/json"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/hashicorp/cli"
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
@@ -21,6 +22,7 @@ import (
 	"github.com/hashicorp/terraform/internal/providers"
 	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/states"
+	"github.com/hashicorp/terraform/internal/states/statefile"
 	"github.com/hashicorp/terraform/internal/states/statemgr"
 	"github.com/hashicorp/terraform/version"
 )
@@ -73,7 +75,8 @@ func TestShow_noArgsNoState(t *testing.T) {
 
 func TestShow_noArgsWithState(t *testing.T) {
 	// Get a temp cwd
-	testCwd(t)
+	tmp := t.TempDir()
+	t.Chdir(tmp)
 	// Create the default state
 	testStateFileDefault(t, testState())
 
@@ -104,7 +107,7 @@ func TestShow_argsWithState(t *testing.T) {
 	statePath := testStateFile(t, testState())
 	stateDir := filepath.Dir(statePath)
 	defer os.RemoveAll(stateDir)
-	defer testChdir(t, stateDir)()
+	t.Chdir(stateDir)
 
 	view, done := testView(t)
 	c := &ShowCommand{
@@ -152,7 +155,7 @@ func TestShow_argsWithStateAliasedProvider(t *testing.T) {
 	statePath := testStateFile(t, testState)
 	stateDir := filepath.Dir(statePath)
 	defer os.RemoveAll(stateDir)
-	defer testChdir(t, stateDir)()
+	t.Chdir(stateDir)
 
 	view, done := testView(t)
 	c := &ShowCommand{
@@ -357,6 +360,271 @@ func TestShow_planWithChanges(t *testing.T) {
 	}
 }
 
+func TestShow_planWithDynamicProviderSource(t *testing.T) {
+	const plannedSource = "terraform.io/builtin/terraform"
+	const wrongSource = "hashicorp/null"
+	tests := []struct {
+		name        string
+		defaultAttr string
+	}{
+		{name: "required"},
+		{name: "conflicting-default", defaultAttr: `default = "hashicorp/null"`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			config := fmt.Sprintf(`
+variable "provider_source" {
+  type = string
+  const = true
+  %s
+}
+terraform {
+  required_providers {
+    terraform = {
+      source = var.provider_source
+    }
+  }
+}
+resource "terraform_data" "example" {
+  input = "saved-plan reproduction"
+}
+`, tc.defaultAttr)
+			if err := os.WriteFile("main.tf", []byte(config), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			view, done := testView(t)
+			init := &InitCommand{Meta: Meta{Ui: testUiWrapped(t), View: view}}
+			if code := init.Run([]string{"-input=false", "-var=provider_source=" + plannedSource}); code != 0 {
+				t.Fatalf("init failed (%d):\n%s", code, done(t).All())
+			}
+			done(t)
+
+			view, done = testView(t)
+			plan := &PlanCommand{Meta: Meta{View: view}}
+			if code := plan.Run([]string{"-input=false", "-var=provider_source=" + plannedSource, "-out=tfplan"}); code != 0 {
+				t.Fatalf("plan failed (%d):\n%s", code, done(t).All())
+			}
+			done(t)
+
+			showTests := []struct {
+				name  string
+				input string
+			}{
+				{name: "no-input"},
+				{name: "conflicting-cli", input: "cli"},
+				{name: "conflicting-environment", input: "environment"},
+				{name: "conflicting-tfvars", input: "tfvars"},
+			}
+			for _, showTC := range showTests {
+				t.Run(showTC.name, func(t *testing.T) {
+					args := []string{"-json"}
+					switch showTC.input {
+					case "cli":
+						args = append(args, "-var=provider_source="+wrongSource)
+					case "environment":
+						t.Setenv("TF_VAR_provider_source", wrongSource)
+					case "tfvars":
+						if err := os.WriteFile("terraform.tfvars", []byte(`provider_source = "hashicorp/null"`), 0644); err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() { os.Remove("terraform.tfvars") })
+					}
+					args = append(args, "tfplan")
+					view, done := testView(t)
+					show := &ShowCommand{Meta: Meta{View: view}}
+					code := show.Run(args)
+					output := done(t)
+					if code != 0 {
+						t.Fatalf("show failed (%d):\n%s", code, output.All())
+					}
+					var result struct {
+						Variables map[string]struct {
+							Value string `json:"value"`
+						} `json:"variables"`
+						ResourceChanges []struct {
+							Address      string `json:"address"`
+							ProviderName string `json:"provider_name"`
+						} `json:"resource_changes"`
+						Configuration struct {
+							ProviderConfig map[string]struct {
+								FullName string `json:"full_name"`
+							} `json:"provider_config"`
+						} `json:"configuration"`
+					}
+					if err := json.Unmarshal([]byte(output.Stdout()), &result); err != nil {
+						t.Fatal(err)
+					}
+					if got := result.Variables["provider_source"].Value; got != plannedSource {
+						t.Errorf("saved provider source = %q; want %q", got, plannedSource)
+					}
+					if len(result.ResourceChanges) != 1 || result.ResourceChanges[0].Address != "terraform_data.example" || result.ResourceChanges[0].ProviderName != plannedSource {
+						t.Errorf("unexpected resource changes: %#v", result.ResourceChanges)
+					}
+					if got := result.Configuration.ProviderConfig["terraform"].FullName; got != plannedSource {
+						t.Errorf("resolved provider = %q; want %q", got, plannedSource)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestShow_planWithDynamicModuleSource(t *testing.T) {
+	const plannedSource = "./child"
+	const wrongSource = "./wrong-child"
+	tests := []struct {
+		name        string
+		defaultAttr string
+	}{
+		{name: "required"},
+		{name: "conflicting-default", defaultAttr: `default = "./wrong-child"`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			config := fmt.Sprintf(`
+variable "module_source" {
+  type = string
+  const = true
+  %s
+}
+module "child" {
+  source = var.module_source
+}
+`, tc.defaultAttr)
+			if err := os.WriteFile("main.tf", []byte(config), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir("child", 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile("child/main.tf", []byte(`
+resource "terraform_data" "example" {
+  input = "saved-plan reproduction"
+}
+`), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			view, done := testView(t)
+			init := &InitCommand{Meta: Meta{Ui: testUiWrapped(t), View: view}}
+			if code := init.Run([]string{"-input=false", "-var=module_source=" + plannedSource}); code != 0 {
+				t.Fatalf("init failed (%d):\n%s", code, done(t).All())
+			}
+			done(t)
+
+			view, done = testView(t)
+			plan := &PlanCommand{Meta: Meta{View: view}}
+			if code := plan.Run([]string{"-input=false", "-var=module_source=" + plannedSource, "-out=tfplan"}); code != 0 {
+				t.Fatalf("plan failed (%d):\n%s", code, done(t).All())
+			}
+			done(t)
+
+			showTests := []struct {
+				name  string
+				input string
+			}{
+				{name: "no-input"},
+				{name: "conflicting-cli", input: "cli"},
+				{name: "conflicting-environment", input: "environment"},
+				{name: "conflicting-tfvars", input: "tfvars"},
+			}
+			for _, showTC := range showTests {
+				t.Run(showTC.name, func(t *testing.T) {
+					args := []string{"-json"}
+					switch showTC.input {
+					case "cli":
+						args = append(args, "-var=module_source="+wrongSource)
+					case "environment":
+						t.Setenv("TF_VAR_module_source", wrongSource)
+					case "tfvars":
+						if err := os.WriteFile("terraform.tfvars", []byte(`module_source = "./wrong-child"`), 0644); err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() { os.Remove("terraform.tfvars") })
+					}
+					args = append(args, "tfplan")
+					view, done := testView(t)
+					show := &ShowCommand{Meta: Meta{View: view}}
+					code := show.Run(args)
+					output := done(t)
+					if code != 0 {
+						t.Fatalf("show failed (%d):\n%s", code, output.All())
+					}
+					var result struct {
+						Variables map[string]struct {
+							Value string `json:"value"`
+						} `json:"variables"`
+						ResourceChanges []struct {
+							Address      string `json:"address"`
+							ProviderName string `json:"provider_name"`
+						} `json:"resource_changes"`
+						Configuration struct {
+							RootModule struct {
+								ModuleCalls map[string]struct {
+									Source string `json:"source"`
+								} `json:"module_calls"`
+							} `json:"root_module"`
+						} `json:"configuration"`
+					}
+					if err := json.Unmarshal([]byte(output.Stdout()), &result); err != nil {
+						t.Fatal(err)
+					}
+					if got := result.Variables["module_source"].Value; got != plannedSource {
+						t.Errorf("saved module source = %q; want %q", got, plannedSource)
+					}
+					if len(result.ResourceChanges) != 1 || result.ResourceChanges[0].Address != "module.child.terraform_data.example" || result.ResourceChanges[0].ProviderName != "terraform.io/builtin/terraform" {
+						t.Errorf("unexpected resource changes: %#v", result.ResourceChanges)
+					}
+					if got := result.Configuration.RootModule.ModuleCalls["child"].Source; got != plannedSource {
+						t.Errorf("resolved module source = %q; want %q", got, plannedSource)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestShow_planWithVarFileDuplicateAttr checks that a -var-file containing a
+// duplicated attribute causes show to fail, rather than silently swallowing
+// the error and exiting 0.
+func TestShow_planWithVarFileDuplicateAttr(t *testing.T) {
+	planPath := showFixturePlanFile(t, plans.Create)
+
+	varFilePath := testTempFile(t)
+	if err := os.WriteFile(varFilePath, []byte("foo = \"first\"\nfoo = \"second\"\n"), 0644); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	view, done := testView(t)
+	c := &ShowCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(showFixtureProvider()),
+			View:             view,
+		},
+	}
+
+	args := []string{
+		"-no-color",
+		"-var-file", varFilePath,
+		planPath,
+	}
+	code := c.Run(args)
+	output := done(t)
+
+	if code == 0 {
+		t.Fatalf("succeeded; want failure with a non-zero exit code\n\nstdout:\n%s", output.Stdout())
+	}
+
+	if got, want := output.Stderr(), "Attribute redefined"; !strings.Contains(got, want) {
+		t.Fatalf("missing expected error message\nwant message containing %q\ngot:\n%s", want, got)
+	}
+}
+
 func TestShow_planWithForceReplaceChange(t *testing.T) {
 	// The main goal of this test is to see that the "replace by request"
 	// resource instance action reason can round-trip through a plan file and
@@ -530,7 +798,7 @@ func TestShow_state(t *testing.T) {
 
 func TestShow_json_output(t *testing.T) {
 	fixtureDir := "testdata/show-json"
-	testDirs, err := ioutil.ReadDir(fixtureDir)
+	testDirs, err := os.ReadDir(fixtureDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,20 +812,19 @@ func TestShow_json_output(t *testing.T) {
 			td := t.TempDir()
 			inputDir := filepath.Join(fixtureDir, entry.Name())
 			testCopyDir(t, inputDir, td)
-			defer testChdir(t, td)()
+			t.Chdir(td)
 
 			expectError := strings.Contains(entry.Name(), "error")
 
-			providerSource, close := newMockProviderSource(t, map[string][]string{
+			providerSource := newMockProviderSource(t, map[string][]string{
 				"test":            {"1.2.3"},
 				"hashicorp2/test": {"1.2.3"},
 			})
-			defer close()
 
 			p := showFixtureProvider()
 
 			// init
-			ui := new(cli.MockUi)
+			ui := testUiWrapped(t)
 			view, _ := testView(t)
 			ic := &InitCommand{
 				Meta: Meta{
@@ -581,7 +848,7 @@ func TestShow_json_output(t *testing.T) {
 				t.Fatalf("unexpected err: %s", err)
 			}
 			defer wantFile.Close()
-			byteValue, err := ioutil.ReadAll(wantFile)
+			byteValue, err := io.ReadAll(wantFile)
 			if err != nil {
 				t.Fatalf("unexpected err: %s", err)
 			}
@@ -659,15 +926,14 @@ func TestShow_json_output_sensitive(t *testing.T) {
 	td := t.TempDir()
 	inputDir := "testdata/show-json-sensitive"
 	testCopyDir(t, inputDir, td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
-	providerSource, close := newMockProviderSource(t, map[string][]string{"test": {"1.2.3"}})
-	defer close()
+	providerSource := newMockProviderSource(t, map[string][]string{"test": {"1.2.3"}})
 
 	p := showFixtureSensitiveProvider()
 
 	// init
-	ui := new(cli.MockUi)
+	ui := testUiWrapped(t)
 	view, _ := testView(t)
 	ic := &InitCommand{
 		Meta: Meta{
@@ -734,7 +1000,100 @@ func TestShow_json_output_sensitive(t *testing.T) {
 		t.Fatalf("unexpected err: %s", err)
 	}
 	defer wantFile.Close()
-	byteValue, err := ioutil.ReadAll(wantFile)
+	byteValue, err := io.ReadAll(wantFile)
+	if err != nil {
+		t.Fatalf("unexpected err: %s", err)
+	}
+	json.Unmarshal([]byte(byteValue), &want)
+
+	// Disregard format version to reduce needless test fixture churn
+	want.FormatVersion = got.FormatVersion
+
+	if !cmp.Equal(got, want) {
+		t.Fatalf("wrong result:\n %v\n", cmp.Diff(got, want))
+	}
+}
+
+func TestShow_json_output_actions(t *testing.T) {
+	td := t.TempDir()
+	inputDir := "testdata/show-json-actions"
+	testCopyDir(t, inputDir, td)
+	t.Chdir(td)
+
+	providerSource := newMockProviderSource(t, map[string][]string{"test": {"1.2.3"}})
+	p := showFixtureProvider()
+
+	// init
+	ui := testUiWrapped(t)
+	view, _ := testView(t)
+	ic := &InitCommand{
+		Meta: Meta{
+			testingOverrides:          metaOverridesForProvider(p),
+			Ui:                        ui,
+			View:                      view,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		},
+	}
+	if code := ic.Run([]string{}); code != 0 {
+		t.Fatalf("init failed\n%s", ui.ErrorWriter)
+	}
+
+	// plan
+	planView, planDone := testView(t)
+	pc := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             planView,
+			ProviderSource:   providerSource,
+		},
+	}
+
+	args := []string{
+		"-out=terraform.plan",
+	}
+	code := pc.Run(args)
+	planOutput := planDone(t)
+
+	if code != 0 {
+		t.Fatalf("unexpected exit status %d; want 0\ngot: %s", code, planOutput.Stderr())
+	}
+
+	// show
+	showView, showDone := testView(t)
+	sc := &ShowCommand{
+		Meta: Meta{
+			testingOverrides:          metaOverridesForProvider(p),
+			View:                      showView,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		},
+	}
+
+	args = []string{
+		"-json",
+		"terraform.plan",
+	}
+	defer os.Remove("terraform.plan")
+	code = sc.Run(args)
+	showOutput := showDone(t)
+
+	if code != 0 {
+		t.Fatalf("unexpected exit status %d; want 0\ngot: %s", code, showOutput.Stderr())
+	}
+
+	// compare ui output to wanted output
+	var got, want plan
+
+	gotString := showOutput.Stdout()
+	json.Unmarshal([]byte(gotString), &got)
+
+	wantFile, err := os.Open("output.json")
+	if err != nil {
+		t.Fatalf("unexpected err: %s", err)
+	}
+	defer wantFile.Close()
+	byteValue, err := io.ReadAll(wantFile)
 	if err != nil {
 		t.Fatalf("unexpected err: %s", err)
 	}
@@ -754,15 +1113,14 @@ func TestShow_json_output_conditions_refresh_only(t *testing.T) {
 	td := t.TempDir()
 	inputDir := "testdata/show-json/conditions"
 	testCopyDir(t, inputDir, td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
-	providerSource, close := newMockProviderSource(t, map[string][]string{"test": {"1.2.3"}})
-	defer close()
+	providerSource := newMockProviderSource(t, map[string][]string{"test": {"1.2.3"}})
 
 	p := showFixtureSensitiveProvider()
 
 	// init
-	ui := new(cli.MockUi)
+	ui := testUiWrapped(t)
 	view, _ := testView(t)
 	ic := &InitCommand{
 		Meta: Meta{
@@ -832,7 +1190,7 @@ func TestShow_json_output_conditions_refresh_only(t *testing.T) {
 		t.Fatalf("unexpected err: %s", err)
 	}
 	defer wantFile.Close()
-	byteValue, err := ioutil.ReadAll(wantFile)
+	byteValue, err := io.ReadAll(wantFile)
 	if err != nil {
 		t.Fatalf("unexpected err: %s", err)
 	}
@@ -849,7 +1207,7 @@ func TestShow_json_output_conditions_refresh_only(t *testing.T) {
 // similar test as above, without the plan
 func TestShow_json_output_state(t *testing.T) {
 	fixtureDir := "testdata/show-json-state"
-	testDirs, err := ioutil.ReadDir(fixtureDir)
+	testDirs, err := os.ReadDir(fixtureDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,17 +1221,16 @@ func TestShow_json_output_state(t *testing.T) {
 			td := t.TempDir()
 			inputDir := filepath.Join(fixtureDir, entry.Name())
 			testCopyDir(t, inputDir, td)
-			defer testChdir(t, td)()
+			t.Chdir(td)
 
-			providerSource, close := newMockProviderSource(t, map[string][]string{
+			providerSource := newMockProviderSource(t, map[string][]string{
 				"test": {"1.2.3"},
 			})
-			defer close()
 
 			p := showFixtureProvider()
 
 			// init
-			ui := new(cli.MockUi)
+			ui := testUiWrapped(t)
 			view, _ := testView(t)
 			ic := &InitCommand{
 				Meta: Meta{
@@ -921,7 +1278,7 @@ func TestShow_json_output_state(t *testing.T) {
 				t.Fatalf("unexpected error: %s", err)
 			}
 			defer wantFile.Close()
-			byteValue, err := ioutil.ReadAll(wantFile)
+			byteValue, err := io.ReadAll(wantFile)
 			if err != nil {
 				t.Fatalf("unexpected err: %s", err)
 			}
@@ -938,7 +1295,7 @@ func TestShow_planWithNonDefaultStateLineage(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("show"), td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	// Write default state file with a testing lineage ("fake-for-testing")
 	testStateFileDefault(t, testState())
@@ -985,7 +1342,7 @@ func TestShow_corruptStatefile(t *testing.T) {
 	td := t.TempDir()
 	inputDir := "testdata/show-corrupt-statefile"
 	testCopyDir(t, inputDir, td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	view, done := testView(t)
 	c := &ShowCommand{
@@ -1009,6 +1366,84 @@ func TestShow_corruptStatefile(t *testing.T) {
 	}
 }
 
+// TestShow_stateStore tests the `show` command with no arguments, which uses the state that
+// matches the selected workspace. In this test the default workspace is in use.
+func TestShow_stateStore(t *testing.T) {
+	originalState := testState()
+	originalState.SetOutputValue(
+		addrs.OutputValue{Name: "test"}.Absolute(addrs.RootModuleInstance),
+		cty.ObjectVal(map[string]cty.Value{
+			"attr": cty.NullVal(cty.DynamicPseudoType),
+			"null": cty.NullVal(cty.String),
+			"list": cty.ListVal([]cty.Value{cty.NullVal(cty.Number)}),
+		}),
+		false,
+	)
+
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("state-store-unchanged/provider-managed-by-terraform"), td)
+	t.Chdir(td)
+
+	// Get bytes describing the state
+	var stateBuf bytes.Buffer
+	if err := statefile.Write(statefile.New(originalState, "", 1), &stateBuf); err != nil {
+		t.Fatalf("error during test setup: %s", err)
+	}
+
+	// Create a mock that contains a persisted "default" state that uses the bytes from above.
+	mockProvider := mockPluggableStateStorageProvider(mockSingleStateStoreSchema("test_store"))
+	mockProvider.MockStates = testing_provider.NewMockStateBytesWithSingleState(
+		"test_store",
+		"default",
+		stateBuf.Bytes(),
+	)
+	mockProviderAddress := addrs.NewDefaultProvider("test")
+
+	view, done := testView(t)
+	c := &ShowCommand{
+		Meta: Meta{
+			AllowExperimentalFeatures: true,
+			testingOverrides: &testingOverrides{
+				Providers: map[addrs.Provider]providers.Factory{
+					mockProviderAddress: providers.FactoryFixed(mockProvider),
+				},
+			},
+			View: view,
+		},
+	}
+
+	args := []string{
+		"-no-color",
+	}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("unexpected exit status %d; want 0\ngot: %s", code, output.Stderr())
+	}
+
+	expected := `# test_instance.foo:
+resource "test_instance" "foo" {
+    id = "bar"
+}
+
+
+Outputs:
+
+test = {
+    list = [
+        null,
+    ]
+}`
+	actual := strings.TrimSpace(output.Stdout())
+	if actual != expected {
+		t.Fatalf("expected = %s'\ngot = %s",
+			expected,
+			actual,
+		)
+	}
+}
+
 // showFixtureSchema returns a schema suitable for processing the configuration
 // in testdata/show. This schema should be assigned to a mock provider
 // named "test".
@@ -1027,6 +1462,15 @@ func showFixtureSchema() *providers.GetProviderSchemaResponse {
 					Attributes: map[string]*configschema.Attribute{
 						"id":  {Type: cty.String, Optional: true, Computed: true},
 						"ami": {Type: cty.String, Optional: true},
+					},
+				},
+			},
+		},
+		Actions: map[string]providers.ActionSchema{
+			"test_action": {
+				ConfigSchema: &configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"attr": {Type: cty.String, Optional: true},
 					},
 				},
 			},

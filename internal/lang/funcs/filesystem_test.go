@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package funcs
@@ -17,67 +17,6 @@ import (
 	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/lang/marks"
 )
-
-func TestFile(t *testing.T) {
-	tests := []struct {
-		Path cty.Value
-		Want cty.Value
-		Err  string
-	}{
-		{
-			cty.StringVal("testdata/hello.txt"),
-			cty.StringVal("Hello World"),
-			``,
-		},
-		{
-			cty.UnknownVal(cty.String).Mark(marks.Sensitive),
-			cty.UnknownVal(cty.String).RefineNotNull().Mark(marks.Sensitive),
-			``,
-		},
-		{
-			cty.StringVal("testdata/icon.png"),
-			cty.NilVal,
-			`contents of "testdata/icon.png" are not valid UTF-8; use the filebase64 function to obtain the Base64 encoded contents or the other file functions (e.g. filemd5, filesha256) to obtain file hashing results instead`,
-		},
-		{
-			cty.StringVal("testdata/icon.png").Mark(marks.Sensitive),
-			cty.NilVal,
-			`contents of (sensitive value) are not valid UTF-8; use the filebase64 function to obtain the Base64 encoded contents or the other file functions (e.g. filemd5, filesha256) to obtain file hashing results instead`,
-		},
-		{
-			cty.StringVal("testdata/missing"),
-			cty.NilVal,
-			`no file exists at "testdata/missing"; this function works only with files that are distributed as part of the configuration source code, so if this file will be created by a resource in this configuration you must instead obtain this result from an attribute of that resource`,
-		},
-		{
-			cty.StringVal("testdata/missing").Mark(marks.Sensitive),
-			cty.NilVal,
-			`no file exists at (sensitive value); this function works only with files that are distributed as part of the configuration source code, so if this file will be created by a resource in this configuration you must instead obtain this result from an attribute of that resource`,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(fmt.Sprintf("File(\".\", %#v)", test.Path), func(t *testing.T) {
-			got, err := File(".", test.Path)
-
-			if test.Err != "" {
-				if err == nil {
-					t.Fatal("succeeded; want error")
-				}
-				if got, want := err.Error(), test.Err; got != want {
-					t.Errorf("wrong error\ngot:  %s\nwant: %s", got, want)
-				}
-				return
-			} else if err != nil {
-				t.Fatalf("unexpected error: %s", err)
-			}
-
-			if !got.RawEquals(test.Want) {
-				t.Errorf("wrong result\ngot:  %#v\nwant: %#v", got, test.Want)
-			}
-		})
-	}
-}
 
 func TestTemplateFile(t *testing.T) {
 	tests := []struct {
@@ -251,7 +190,7 @@ func TestTemplateFile(t *testing.T) {
 	funcsFunc := func() (funcTable map[string]function.Function, fsFuncs collections.Set[string], templateFuncs collections.Set[string]) {
 		return funcs, collections.NewSetCmp[string](), collections.NewSetCmp[string]("templatefile")
 	}
-	templateFileFn := MakeTemplateFileFunc(".", funcsFunc)
+	templateFileFn := MakeTemplateFileFunc(".", funcsFunc, noopWrapper)
 	funcs["templatefile"] = templateFileFn
 	funcs["core::templatefile"] = templateFileFn
 
@@ -339,7 +278,7 @@ func TestFileExists(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("FileExists(\".\", %#v)", test.Path), func(t *testing.T) {
-			got, err := FileExists(".", test.Path)
+			got, err := testFileExists(".", test.Path)
 
 			if test.Err != "" {
 				if err == nil {
@@ -573,7 +512,7 @@ func TestFileSet(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("FileSet(\".\", %#v, %#v)", test.Path, test.Pattern), func(t *testing.T) {
-			got, err := FileSet(".", test.Path, test.Pattern)
+			got, err := testFileSet(".", test.Path, test.Pattern)
 
 			if test.Err != "" {
 				if err == nil {
@@ -592,6 +531,72 @@ func TestFileSet(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFileSet_symlinks(t *testing.T) {
+	t.Run("dangling target", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "real.txt"))
+		symlinkTestFile(t, "missing.txt", filepath.Join(dir, "dangling.txt"))
+
+		tests := map[string]cty.Value{
+			"*.txt":        cty.SetVal([]cty.Value{cty.StringVal("real.txt")}),
+			"dangling.txt": cty.SetValEmpty(cty.String),
+		}
+		for pattern, want := range tests {
+			got, err := testFileSet(dir, cty.StringVal("."), cty.StringVal(pattern))
+			if err != nil {
+				t.Fatalf("unexpected error for pattern %q: %s", pattern, err)
+			}
+
+			if !got.RawEquals(want) {
+				t.Errorf("wrong result for pattern %q\ngot:  %#v\nwant: %#v", pattern, got, want)
+			}
+		}
+	})
+
+	t.Run("non-directory target component", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "real.txt"))
+		writeTestFile(t, filepath.Join(dir, "plain"))
+		symlinkTestFile(t, filepath.Join("plain", "child"), filepath.Join(dir, "unresolvable.txt"))
+
+		got, err := testFileSet(dir, cty.StringVal("."), cty.StringVal("*.txt"))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		want := cty.SetVal([]cty.Value{cty.StringVal("real.txt")})
+		if !got.RawEquals(want) {
+			t.Errorf("wrong result\ngot:  %#v\nwant: %#v", got, want)
+		}
+	})
+
+	t.Run("regular file target", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "target"))
+		symlinkTestFile(t, "target", filepath.Join(dir, "linked.txt"))
+
+		got, err := testFileSet(dir, cty.StringVal("."), cty.StringVal("*.txt"))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		want := cty.SetVal([]cty.Value{cty.StringVal("linked.txt")})
+		if !got.RawEquals(want) {
+			t.Errorf("wrong result\ngot:  %#v\nwant: %#v", got, want)
+		}
+	})
+
+	t.Run("symlink loop", func(t *testing.T) {
+		dir := t.TempDir()
+		symlinkTestFile(t, "loop.txt", filepath.Join(dir, "loop.txt"))
+
+		_, err := testFileSet(dir, cty.StringVal("."), cty.StringVal("*.txt"))
+		if err == nil {
+			t.Fatal("succeeded; want error")
+		}
+	})
 }
 
 func TestFileBase64(t *testing.T) {
@@ -619,7 +624,7 @@ func TestFileBase64(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("FileBase64(\".\", %#v)", test.Path), func(t *testing.T) {
-			got, err := FileBase64(".", test.Path)
+			got, err := testFileBase64(".", test.Path)
 
 			if test.Err {
 				if err == nil {
@@ -662,7 +667,7 @@ func TestBasename(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("Basename(%#v)", test.Path), func(t *testing.T) {
-			got, err := Basename(test.Path)
+			got, err := BasenameFunc.Call([]cty.Value{test.Path})
 
 			if test.Err {
 				if err == nil {
@@ -710,7 +715,7 @@ func TestDirname(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("Dirname(%#v)", test.Path), func(t *testing.T) {
-			got, err := Dirname(test.Path)
+			got, err := DirnameFunc.Call([]cty.Value{test.Path})
 
 			if test.Err {
 				if err == nil {
@@ -763,7 +768,7 @@ func TestPathExpand(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("Dirname(%#v)", test.Path), func(t *testing.T) {
-			got, err := Pathexpand(test.Path)
+			got, err := PathExpandFunc.Call([]cty.Value{test.Path})
 
 			if test.Err {
 				if err == nil {
@@ -778,5 +783,34 @@ func TestPathExpand(t *testing.T) {
 				t.Errorf("wrong result\ngot:  %#v\nwant: %#v", got, test.Want)
 			}
 		})
+	}
+}
+
+func testFileExists(baseDir string, path cty.Value) (cty.Value, error) {
+	fn := MakeFileExistsFunc(baseDir, noopWrapper)
+	return fn.Call([]cty.Value{path})
+}
+
+func testFileSet(baseDir string, path, pattern cty.Value) (cty.Value, error) {
+	fn := MakeFileSetFunc(baseDir, noopWrapper)
+	return fn.Call([]cty.Value{path, pattern})
+}
+
+func testFileBase64(baseDir string, path cty.Value) (cty.Value, error) {
+	fn := MakeFileFunc(baseDir, true, noopWrapper)
+	return fn.Call([]cty.Value{path})
+}
+
+func writeTestFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func symlinkTestFile(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("cannot create symlink: %s", err)
 	}
 }

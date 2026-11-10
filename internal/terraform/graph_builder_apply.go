@@ -1,14 +1,17 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
 
 import (
+	"slices"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/dag"
 	"github.com/hashicorp/terraform/internal/moduletest/mocking"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -27,10 +30,6 @@ type ApplyGraphBuilder struct {
 
 	// Changes describes the changes that we need apply.
 	Changes *plans.ChangesSrc
-
-	// DeferredChanges describes the changes that were deferred during the plan
-	// and should not be applied.
-	DeferredChanges []*plans.DeferredResourceInstanceChangeSrc
 
 	// State is the current state
 	State *states.State
@@ -54,7 +53,11 @@ type ApplyGraphBuilder struct {
 	// unnecessary outputs aren't included in the apply graph. The plan
 	// builder successfully handles targeting resources. In the future,
 	// outputs should go into the diff so that this is unnecessary.
-	Targets []addrs.Targetable
+	Targets []addrs.TargetPattern
+
+	// ActionTargets are actions to target. As with Targets we need to remove
+	// outputs, so when/if we remove Targets we can remove this as well.
+	ActionTargets []addrs.TargetPattern
 
 	// ForceReplace are the resource instance addresses that the user
 	// requested to force replacement for when creating the plan, if any.
@@ -77,6 +80,22 @@ type ApplyGraphBuilder struct {
 	// SkipGraphValidation indicates whether the graph builder should skip
 	// validation of the graph.
 	SkipGraphValidation bool
+
+	// AllowRootEphemeralOutputs overrides a specific check made within the
+	// output nodes that they cannot be ephemeral at within root modules. This
+	// should be set to true for plans executing from within either the stacks
+	// or test runtimes, where the root modules as Terraform sees them aren't
+	// the actual root modules.
+	AllowRootEphemeralOutputs bool
+
+	// AllowRootDeprecatedOutputs overrides a specific check made within the
+	// output nodes that they cannot be deprecated for root modules. This
+	// should be set to true for plans executing from within the test runtime,
+	// where the root module as Terraform sees it isn't the actual root module.
+	AllowRootDeprecatedOutputs bool
+
+	// PolicyClient is the client for evaluating policies.
+	PolicyClient policy.Client
 }
 
 // See GraphBuilder
@@ -106,7 +125,7 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 	concreteResourceInstance := func(a *NodeAbstractResourceInstance) dag.Vertex {
 		return &NodeApplyableResourceInstance{
 			NodeAbstractResourceInstance: a,
-			forceReplace:                 b.ForceReplace,
+			forceReplace:                 slices.ContainsFunc(b.ForceReplace, a.Addr.Equal),
 		}
 	}
 
@@ -130,27 +149,32 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 			Config:       b.Config,
 			DestroyApply: b.Operation == walkDestroy,
 		},
-		&variableValidationTransformer{},
+		&variableValidationTransformer{
+			operation: b.Operation,
+		},
 		&LocalTransformer{Config: b.Config},
 		&OutputTransformer{
-			Config:     b.Config,
-			Destroying: b.Operation == walkDestroy,
-			Overrides:  b.Overrides,
+			Config:                     b.Config,
+			Destroying:                 b.Operation == walkDestroy,
+			Overrides:                  b.Overrides,
+			AllowRootEphemeralOutputs:  b.AllowRootEphemeralOutputs,
+			AllowRootDeprecatedOutputs: b.AllowRootDeprecatedOutputs,
 		},
 
 		// Creates all the resource instances represented in the diff, along
 		// with dependency edges against the whole-resource nodes added by
 		// ConfigTransformer above.
 		&DiffTransformer{
-			Concrete: concreteResourceInstance,
-			State:    b.State,
-			Changes:  b.Changes,
-			Config:   b.Config,
+			Concrete:     concreteResourceInstance,
+			State:        b.State,
+			Changes:      b.Changes,
+			Config:       b.Config,
+			PolicyClient: b.PolicyClient,
 		},
 
-		// Creates nodes for all the deferred changes.
-		&DeferredTransformer{
-			DeferredChanges: b.DeferredChanges,
+		&ActionDiffTransformer{
+			Changes: b.Changes,
+			Config:  b.Config,
 		},
 
 		// Add nodes and edges for check block assertions. Check block data
@@ -184,6 +208,9 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 		// objects that can belong to modules.
 		&ModuleExpansionTransformer{Config: b.Config},
 
+		// Evaluate module policies before the objects within each module.
+		&ModulePolicyTransformer{Config: b.Config, PolicyClient: b.PolicyClient},
+
 		// Plug in any external references.
 		&ExternalReferenceTransformer{
 			ExternalReferences: b.ExternalReferences,
@@ -197,24 +224,17 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 		// done its thing.
 		&checkStartTransformer{Config: b.Config, Operation: b.Operation},
 
-		// Detect when create_before_destroy must be forced on for a particular
-		// node due to dependency edges, to avoid graph cycles during apply.
-		//
-		// FIXME: this should not need to be recalculated during apply.
-		// Currently however, the instance object which stores the planned
-		// information is lost for newly created instances because it contains
-		// no state value, and we end up recalculating CBD for all nodes.
-		&ForcedCBDTransformer{},
-
 		// Destruction ordering
 		&DestroyEdgeTransformer{
 			Changes:   b.Changes,
 			Operation: b.Operation,
 		},
-		&CBDEdgeTransformer{
-			Config: b.Config,
-			State:  b.State,
-		},
+
+		// Order the destroy nodes for create_before_destroy as planned. This
+		// also forces create_before_destroy for the dependencies of
+		// create_before_destroy nodes, so the status is stored in their new
+		// state.
+		&CBDEdgeTransformer{},
 
 		// In a destroy, we need to remove configuration nodes that are not used
 		// at all, as they may not be able to evaluate. These include variables,
@@ -224,13 +244,16 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 		},
 
 		// Target
-		&TargetsTransformer{Targets: b.Targets},
+		&TargetsTransformer{Targets: slices.Concat(b.Targets, b.ActionTargets)},
 
 		// Close any ephemeral resource instances.
 		&ephemeralResourceCloseTransformer{},
 
 		// Close opened plugin connections
 		&CloseProviderTransformer{},
+
+		// Request policy evaluation for resources.
+		&policyEvalTransformer{PolicyClient: b.PolicyClient},
 
 		// close the root module
 		&CloseRootModuleTransformer{},

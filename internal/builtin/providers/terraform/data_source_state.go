@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -129,12 +129,12 @@ func dataSourceRemoteStateRead(d cty.Value) (cty.Value, tfdiags.Diagnostics) {
 		workspaceName = workspaceVal.AsString()
 	}
 
-	state, err := b.StateMgr(workspaceName)
-	if err != nil {
+	state, sDiags := b.StateMgr(workspaceName)
+	if sDiags.HasErrors() {
 		diags = diags.Append(tfdiags.AttributeValue(
 			tfdiags.Error,
 			"Error loading state error",
-			fmt.Sprintf("error loading the remote state: %s", err),
+			fmt.Sprintf("error loading the remote state: %s", sDiags.Err()),
 			cty.Path(nil).GetAttr("backend"),
 		))
 		return cty.NilVal, diags
@@ -239,7 +239,7 @@ func getBackend(cfg cty.Value) (backend.Backend, cty.Value, tfdiags.Diagnostics)
 		return nil, cty.NilVal, diags
 	}
 
-	// If this is the enhanced remote backend, we want to disable the version
+	// If this is the remote OperationsBackend, we want to disable the version
 	// check, because this is a read-only operation
 	if rb, ok := b.(*remote.Remote); ok {
 		rb.IgnoreVersionConflict()

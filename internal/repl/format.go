@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package repl
@@ -20,12 +20,21 @@ func FormatValue(v cty.Value, indent int) string {
 	if !v.IsKnown() {
 		return "(known after apply)"
 	}
-	if v.HasMark(marks.Sensitive) {
+
+	// Any marks on the value must either be used to return
+	// early or be removed. In future marks may used to cause
+	// values to be annotated, but the mark will still need to be
+	// removed before we can get a string representation of the value.
+	if marks.Has(v, marks.Sensitive) {
 		return "(sensitive value)"
 	}
-	if v.HasMark(marks.Ephemeral) {
+	if marks.Has(v, marks.Ephemeral) {
 		return "(ephemeral value)"
 	}
+	// Deprecation mark doesn't impact formatting, so remove
+	// to unblock normal formatting below
+	v, _ = marks.GetDeprecationMarks(v)
+
 	if v.IsNull() {
 		ty := v.Type()
 		switch {

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -14,7 +14,7 @@ import (
 
 // Input returns whether or not input asking is enabled.
 func (m *Meta) Input() bool {
-	if test || !m.input {
+	if !m.testingOverrides.Input() || !m.input {
 		return false
 	}
 

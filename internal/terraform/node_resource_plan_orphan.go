@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -6,6 +6,7 @@ package terraform
 import (
 	"fmt"
 	"log"
+	"slices"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/plans"
@@ -26,13 +27,9 @@ type NodePlannableResourceInstanceOrphan struct {
 	// for any instances.
 	skipPlanChanges bool
 
-	// forgetResources lists resources that should not be destroyed, only removed
-	// from state.
-	forgetResources []addrs.ConfigResource
-
-	// forgetModules lists modules that should not be destroyed, only removed
-	// from state.
-	forgetModules []addrs.Module
+	// forget lists the modules and resources whose instances should not be
+	// destroyed, only removed from state.
+	forget []addrs.Targetable
 }
 
 var (
@@ -45,10 +42,15 @@ var (
 	_ GraphNodeAttachResourceState  = (*NodePlannableResourceInstanceOrphan)(nil)
 	_ GraphNodeExecutable           = (*NodePlannableResourceInstanceOrphan)(nil)
 	_ GraphNodeProviderConsumer     = (*NodePlannableResourceInstanceOrphan)(nil)
+	_ GraphNodeDestroyer            = (*NodePlannableResourceInstanceOrphan)(nil)
 )
 
 func (n *NodePlannableResourceInstanceOrphan) Name() string {
 	return n.ResourceInstanceAddr().String() + " (orphan)"
+}
+
+func (n *NodePlannableResourceInstanceOrphan) DestroyAddr() addrs.AbsResourceInstance {
+	return n.ResourceInstanceAddr()
 }
 
 // GraphNodeExecutable
@@ -66,12 +68,28 @@ func (n *NodePlannableResourceInstanceOrphan) Execute(ctx EvalContext, op walkOp
 	}
 }
 
-func (n *NodePlannableResourceInstanceOrphan) ProvidedBy() (addr addrs.ProviderConfig, exact bool) {
+func (n *NodePlannableResourceInstanceOrphan) Provider() ProviderRef {
 	if n.Addr.Resource.Resource.Mode == addrs.DataResourceMode {
 		// indicate that this node does not require a configured provider
-		return nil, true
+		p := n.NodeAbstractResourceInstance.Provider()
+		p.Offline = true
+		return p
 	}
-	return n.NodeAbstractResourceInstance.ProvidedBy()
+	return n.NodeAbstractResourceInstance.Provider()
+}
+
+func (n *NodePlannableResourceInstanceOrphan) ReferenceableAddrs() []addrs.Referenceable {
+	// destroy nodes are not referenceable, so we must override the method from
+	// the abstract layers
+	return nil
+}
+
+func (n *NodePlannableResourceInstanceOrphan) References() (refs []*addrs.Reference) {
+	return nil
+}
+
+func (n *NodePlannableResourceInstanceOrphan) AttachActionTriggers(triggers []*resourceActionTrigger) {
+	n.actionTriggers = triggers
 }
 
 func (n *NodePlannableResourceInstanceOrphan) dataResourceExecute(ctx EvalContext) tfdiags.Diagnostics {
@@ -91,7 +109,7 @@ func (n *NodePlannableResourceInstanceOrphan) dataResourceExecute(ctx EvalContex
 func (n *NodePlannableResourceInstanceOrphan) managedResourceExecute(ctx EvalContext) (diags tfdiags.Diagnostics) {
 	addr := n.ResourceInstanceAddr()
 
-	oldState, readDiags := n.readResourceInstanceState(ctx, addr)
+	oldState, _, readDiags := n.readResourceInstanceState(ctx, addr)
 	diags = diags.Append(readDiags)
 	if diags.HasErrors() {
 		return diags
@@ -110,14 +128,12 @@ func (n *NodePlannableResourceInstanceOrphan) managedResourceExecute(ctx EvalCon
 		return diags
 	}
 
-	var forget bool
-	for _, ft := range n.forgetResources {
-		if ft.Equal(n.ResourceAddr()) {
-			forget = true
-		}
-	}
-	for _, fm := range n.forgetModules {
-		if fm.TargetContains(n.Addr) {
+	forget := slices.ContainsFunc(n.forget, func(addr addrs.Targetable) bool {
+		return addr.Contains(n.Addr)
+	})
+
+	if n.Config != nil && n.Config.Managed != nil {
+		if n.Config.Managed.DestroySet && !n.Config.Managed.Destroy {
 			forget = true
 		}
 	}
@@ -146,8 +162,6 @@ func (n *NodePlannableResourceInstanceOrphan) managedResourceExecute(ctx EvalCon
 		}
 	}
 
-	shouldDefer := ctx.Deferrals().ShouldDeferResourceInstanceChanges(n.Addr, n.Dependencies)
-
 	var change *plans.ResourceInstanceChange
 	var pDiags tfdiags.Diagnostics
 	var deferred *providers.Deferred
@@ -167,11 +181,7 @@ func (n *NodePlannableResourceInstanceOrphan) managedResourceExecute(ctx EvalCon
 	// sometimes not have a reason.)
 	change.ActionReason = n.deleteActionReason(ctx)
 
-	if deferred != nil {
-		ctx.Deferrals().ReportResourceInstanceDeferred(n.Addr, deferred.Reason, change)
-		return diags
-	} else if shouldDefer {
-		ctx.Deferrals().ReportResourceInstanceDeferred(n.Addr, providers.DeferredReasonDeferredPrereq, change)
+	if n.deferPlannedChange(ctx, deferred, change) {
 		return diags
 	}
 
@@ -188,9 +198,18 @@ func (n *NodePlannableResourceInstanceOrphan) managedResourceExecute(ctx EvalCon
 	// context surrounding the change, rather than the change itself, and
 	// so it's helpful to still include the valid-in-isolation change as
 	// part of the plan as additional context in our error output.
-	diags = diags.Append(n.writeChange(ctx, change, ""))
+	diags = diags.Append(n.writeChange(ctx, change, states.NotDeposed))
 	if diags.HasErrors() {
 		return diags
+	}
+
+	// Plan the triggered actions before anything else is recorded, because
+	// the resource must be deferred instead if any of those actions are
+	// deferred.
+	actionInvocations, actionsDeferred, actionDiags := n.planActionTriggers(ctx, EvalDataForInstanceKey(n.ResourceInstanceAddr().Resource.Key, nil), change)
+	if actionsDeferred {
+		n.deferForActions(ctx, change)
+		return diags.Append(tfdiags.OverrideAll(actionDiags, tfdiags.Warning, nil))
 	}
 
 	if !forget {
@@ -200,7 +219,24 @@ func (n *NodePlannableResourceInstanceOrphan) managedResourceExecute(ctx EvalCon
 		}
 	}
 
-	return diags.Append(n.writeResourceInstanceState(ctx, nil, workingState))
+	diags = diags.Append(n.writeResourceInstanceState(ctx, nil, workingState))
+
+	if actionDiags.HasErrors() {
+		// Orphaned destroy actions may not have enough configuration
+		// information to plan, but we can't block their progress since the
+		// config no longer exists. We'll still keep the original diags as
+		// warnings, but add an additional message to help explain the failure
+		// mode.
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Warning,
+			"Orphaned action failed to plan",
+			fmt.Sprintf("One or more actions for the orphaned instance %s does not have enough configuration information to complete a plan, and will not be invoked", n.Addr),
+		))
+	}
+	diags = diags.Append(tfdiags.OverrideAll(actionDiags, tfdiags.Warning, nil))
+	recordActionInvocations(ctx, actionInvocations)
+
+	return diags
 }
 
 func (n *NodePlannableResourceInstanceOrphan) deleteActionReason(ctx EvalContext) plans.ResourceInstanceChangeActionReason {

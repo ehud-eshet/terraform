@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 // Package format contains helpers for formatting various Terraform
@@ -20,6 +20,8 @@ func DiffActionSymbol(action plans.Action) string {
 	switch action {
 	case plans.DeleteThenCreate:
 		return "[red]-[reset]/[green]+[reset]"
+	case plans.ForgetThenCreate:
+		return "[red].[reset]/[green]+[reset]"
 	case plans.CreateThenDelete:
 		return "[green]+[reset]/[red]-[reset]"
 	case plans.Create:

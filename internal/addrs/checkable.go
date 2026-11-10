@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package addrs
@@ -39,6 +39,7 @@ type Checkable interface {
 
 	CheckableKind() CheckableKind
 	String() string
+	ModuleInstance() ModuleInstance
 }
 
 var (
@@ -100,7 +101,7 @@ func ParseCheckableStr(kind CheckableKind, src string) (Checkable, tfdiags.Diagn
 		return nil, diags
 	}
 
-	path, remain, diags := parseModuleInstancePrefix(traversal, false)
+	path, remain, diags := parseModuleInstancePrefix(traversal, knownInstanceKeys)
 	if diags.HasErrors() {
 		return nil, diags
 	}
@@ -157,7 +158,7 @@ func ParseCheckableStr(kind CheckableKind, src string) (Checkable, tfdiags.Diagn
 	// might be a resource whose type is literally "output".
 	switch kind {
 	case CheckableResource:
-		riAddr, moreDiags := parseResourceInstanceUnderModule(path, false, remain)
+		riAddr, moreDiags := parseResourceInstanceUnderModule(path, knownInstanceKeys, remain)
 		diags = diags.Append(moreDiags)
 		if diags.HasErrors() {
 			return nil, diags

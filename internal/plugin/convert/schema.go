@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package convert
@@ -11,30 +11,33 @@ import (
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/providers"
 	proto "github.com/hashicorp/terraform/internal/tfplugin5"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // ConfigSchemaToProto takes a *configschema.Block and converts it to a
 // proto.Schema_Block for a grpc response.
 func ConfigSchemaToProto(b *configschema.Block) *proto.Schema_Block {
 	block := &proto.Schema_Block{
-		Description:     b.Description,
-		DescriptionKind: protoStringKind(b.DescriptionKind),
-		Deprecated:      b.Deprecated,
+		Description:        b.Description,
+		DescriptionKind:    protoStringKind(b.DescriptionKind),
+		Deprecated:         b.Deprecated,
+		DeprecationMessage: b.DeprecationMessage,
 	}
 
 	for _, name := range sortedKeys(b.Attributes) {
 		a := b.Attributes[name]
 
 		attr := &proto.Schema_Attribute{
-			Name:            name,
-			Description:     a.Description,
-			DescriptionKind: protoStringKind(a.DescriptionKind),
-			Optional:        a.Optional,
-			Computed:        a.Computed,
-			Required:        a.Required,
-			Sensitive:       a.Sensitive,
-			Deprecated:      a.Deprecated,
-			WriteOnly:       a.WriteOnly,
+			Name:               name,
+			Description:        a.Description,
+			DescriptionKind:    protoStringKind(a.DescriptionKind),
+			Optional:           a.Optional,
+			Computed:           a.Computed,
+			Required:           a.Required,
+			Sensitive:          a.Sensitive,
+			Deprecated:         a.Deprecated,
+			DeprecationMessage: a.DeprecationMessage,
+			WriteOnly:          a.WriteOnly,
 		}
 
 		ty, err := json.Marshal(a.Type)
@@ -90,10 +93,63 @@ func protoSchemaNestedBlock(name string, b *configschema.NestedBlock) *proto.Sch
 }
 
 // ProtoToProviderSchema takes a proto.Schema and converts it to a providers.Schema.
-func ProtoToProviderSchema(s *proto.Schema) providers.Schema {
-	return providers.Schema{
+// It takes an optional resource identity schema for resources that support identity.
+func ProtoToProviderSchema(s *proto.Schema, id *proto.ResourceIdentitySchema) providers.Schema {
+	schema := providers.Schema{
 		Version: s.Version,
 		Body:    ProtoToConfigSchema(s.Block),
+	}
+
+	if id != nil {
+		schema.IdentityVersion = id.Version
+		schema.Identity = ProtoToIdentitySchema(id.IdentityAttributes)
+	}
+
+	return schema
+}
+
+func ProtoToActionSchema(s *proto.ActionSchema) providers.ActionSchema {
+	return providers.ActionSchema{
+		ConfigSchema: ProtoToConfigSchema(s.Schema.Block),
+	}
+}
+
+func ProtoToListSchema(s *proto.Schema) providers.Schema {
+	listSchema := ProtoToProviderSchema(s, nil)
+	itemCount := 0
+	// check if the provider has set some attributes/blocks as required.
+	// When yes, then we set minItem = 1, which
+	// validates that the configuration contains a "config" block.
+	for _, attrS := range listSchema.Body.Attributes {
+		if attrS.Required {
+			itemCount = 1
+			break
+		}
+	}
+	for _, block := range listSchema.Body.BlockTypes {
+		if block.MinItems > 0 {
+			itemCount = 1
+			break
+		}
+	}
+	return providers.Schema{
+		Version: s.Version,
+		Body: &configschema.Block{
+			Attributes: map[string]*configschema.Attribute{
+				"data": {
+					Type:     cty.DynamicPseudoType,
+					Computed: true,
+				},
+			},
+			BlockTypes: map[string]*configschema.NestedBlock{
+				"config": {
+					Block:    *listSchema.Body,
+					Nesting:  configschema.NestingSingle,
+					MinItems: itemCount,
+					MaxItems: itemCount,
+				},
+			},
+		},
 	}
 }
 
@@ -104,21 +160,23 @@ func ProtoToConfigSchema(b *proto.Schema_Block) *configschema.Block {
 		Attributes: make(map[string]*configschema.Attribute),
 		BlockTypes: make(map[string]*configschema.NestedBlock),
 
-		Description:     b.Description,
-		DescriptionKind: schemaStringKind(b.DescriptionKind),
-		Deprecated:      b.Deprecated,
+		Description:        b.Description,
+		DescriptionKind:    schemaStringKind(b.DescriptionKind),
+		Deprecated:         b.Deprecated,
+		DeprecationMessage: b.DeprecationMessage,
 	}
 
 	for _, a := range b.Attributes {
 		attr := &configschema.Attribute{
-			Description:     a.Description,
-			DescriptionKind: schemaStringKind(a.DescriptionKind),
-			Required:        a.Required,
-			Optional:        a.Optional,
-			Computed:        a.Computed,
-			Sensitive:       a.Sensitive,
-			Deprecated:      a.Deprecated,
-			WriteOnly:       a.WriteOnly,
+			Description:        a.Description,
+			DescriptionKind:    schemaStringKind(a.DescriptionKind),
+			Required:           a.Required,
+			Optional:           a.Optional,
+			Computed:           a.Computed,
+			Sensitive:          a.Sensitive,
+			Deprecated:         a.Deprecated,
+			DeprecationMessage: a.DeprecationMessage,
+			WriteOnly:          a.WriteOnly,
 		}
 
 		if err := json.Unmarshal(a.Type, &attr.Type); err != nil {
@@ -187,4 +245,55 @@ func sortedKeys(m interface{}) []string {
 
 	sort.Strings(keys)
 	return keys
+}
+
+func ProtoToIdentitySchema(attributes []*proto.ResourceIdentitySchema_IdentityAttribute) *configschema.Object {
+	obj := &configschema.Object{
+		Attributes: make(map[string]*configschema.Attribute),
+		Nesting:    configschema.NestingSingle,
+	}
+
+	for _, a := range attributes {
+		attr := &configschema.Attribute{
+			Description: a.Description,
+			Required:    a.RequiredForImport,
+			Optional:    a.OptionalForImport,
+		}
+
+		if err := json.Unmarshal(a.Type, &attr.Type); err != nil {
+			panic(err)
+		}
+
+		obj.Attributes[a.Name] = attr
+	}
+
+	return obj
+}
+
+func ResourceIdentitySchemaToProto(b providers.IdentitySchema) *proto.ResourceIdentitySchema {
+	attrs := []*proto.ResourceIdentitySchema_IdentityAttribute{}
+	for _, name := range sortedKeys(b.Body.Attributes) {
+		a := b.Body.Attributes[name]
+
+		attr := &proto.ResourceIdentitySchema_IdentityAttribute{
+			Name:              name,
+			Description:       a.Description,
+			RequiredForImport: a.Required,
+			OptionalForImport: a.Optional,
+		}
+
+		ty, err := json.Marshal(a.Type)
+		if err != nil {
+			panic(err)
+		}
+
+		attr.Type = ty
+
+		attrs = append(attrs, attr)
+	}
+
+	return &proto.ResourceIdentitySchema{
+		Version:            b.Version,
+		IdentityAttributes: attrs,
+	}
 }

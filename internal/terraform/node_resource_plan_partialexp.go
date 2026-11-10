@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -115,9 +115,9 @@ func (n *nodePlannablePartialExpandedResource) Execute(ctx EvalContext, op walkO
 	case addrs.DataResourceMode:
 		change, changeDiags := n.dataResourceExecute(ctx)
 		diags = diags.Append(changeDiags)
-		ctx.Deferrals().ReportDataSourceExpansionDeferred(n.addr, change)
+		ctx.Deferrals().ReportResourceExpansionDeferred(n.addr, change)
 	case addrs.EphemeralResourceMode:
-		ctx.Deferrals().ReportEphemeralResourceExpansionDeferred(n.addr)
+		ctx.Deferrals().ReportResourceExpansionDeferred(n.addr, nil)
 	default:
 		panic(fmt.Errorf("unsupported resource mode %s", n.config.Mode))
 	}
@@ -165,8 +165,8 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 		return &change, diags
 	}
 
-	schema, _ := providerSchema.SchemaForResourceAddr(n.addr.Resource())
-	if schema == nil {
+	schema := providerSchema.SchemaForResourceAddr(n.addr.Resource())
+	if schema.Body == nil {
 		// Should be caught during validation, so we don't bother with a pretty error here
 		diags = diags.Append(fmt.Errorf("provider does not support resource type %q", n.addr.Resource().Type))
 		return &change, diags
@@ -194,9 +194,16 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 
 	keyData := n.keyData()
 
-	configVal, _, configDiags := ctx.EvaluateBlock(n.config.Config, schema, nil, keyData)
+	configVal, _, configDiags := ctx.EvaluateBlock(n.config.Config, schema.Body, nil, keyData)
 	diags = diags.Append(configDiags)
 	if configDiags.HasErrors() {
+		return &change, diags
+	}
+
+	var deprecationDiags tfdiags.Diagnostics
+	configVal, deprecationDiags = ctx.Deprecations().ValidateAndUnmarkConfig(configVal, schema.Body, n.ResourceAddr().Module)
+	diags = diags.Append(deprecationDiags.InConfigBody(n.config.Config, n.addr.String()))
+	if diags.HasErrors() {
 		return &change, diags
 	}
 
@@ -214,8 +221,8 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 	}
 
 	unmarkedConfigVal, unmarkedPaths := configVal.UnmarkDeepWithPaths()
-	priorVal := cty.NullVal(schema.ImpliedType()) // we don't have any specific prior value to use
-	proposedNewVal := objchange.ProposedNew(schema, priorVal, unmarkedConfigVal)
+	priorVal := cty.NullVal(schema.Body.ImpliedType()) // we don't have any specific prior value to use
+	proposedNewVal := objchange.ProposedNew(schema.Body, priorVal, unmarkedConfigVal)
 
 	// The provider now gets to plan an imaginary substitute that represents
 	// all of the possible resource instances together. Correctly-implemented
@@ -225,14 +232,11 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 	// learn a subset of the "computed" attribute values to save as part
 	// of our placeholder value for downstream checks.
 	resp := provider.PlanResourceChange(providers.PlanResourceChangeRequest{
-		TypeName:         n.addr.Resource().Type,
-		Config:           unmarkedConfigVal,
-		PriorState:       priorVal,
-		ProposedNewState: proposedNewVal,
-		// TODO: Should we send "ProviderMeta" here? We don't have the
-		// necessary data for that wired through here right now, but
-		// we might need to do that before stabilizing support for unknown
-		// resource instance expansion.
+		TypeName:           n.addr.Resource().Type,
+		Config:             unmarkedConfigVal,
+		PriorState:         priorVal,
+		ProposedNewState:   proposedNewVal,
+		ClientCapabilities: ctx.ClientCapabilities(),
 	})
 	diags = diags.Append(resp.Diagnostics.InConfigBody(n.config.Config, n.addr.String()))
 	if diags.HasErrors() {
@@ -247,7 +251,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 		panic(fmt.Sprintf("PlanResourceChange of %s produced nil value", n.addr.String()))
 	}
 
-	for _, err := range plannedNewVal.Type().TestConformance(schema.ImpliedType()) {
+	for _, err := range plannedNewVal.Type().TestConformance(schema.Body.ImpliedType()) {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
 			"Provider produced invalid plan",
@@ -261,7 +265,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 		return &change, diags
 	}
 
-	if errs := objchange.AssertPlanValid(schema, priorVal, unmarkedConfigVal, plannedNewVal); len(errs) > 0 {
+	if errs := objchange.AssertPlanValid(schema.Body, priorVal, unmarkedConfigVal, plannedNewVal); len(errs) > 0 {
 		if resp.LegacyTypeSystem {
 			// The shimming of the old type system in the legacy SDK is not precise
 			// enough to pass this consistency check, so we'll give it a pass here,
@@ -295,7 +299,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 	// We need to combine the dynamic marks with the static marks implied by
 	// the provider's schema.
 	plannedNewVal = plannedNewVal.MarkWithPaths(unmarkedPaths)
-	if sensitivePaths := schema.SensitivePaths(plannedNewVal, nil); len(sensitivePaths) != 0 {
+	if sensitivePaths := schema.Body.SensitivePaths(plannedNewVal, nil); len(sensitivePaths) != 0 {
 		plannedNewVal = marks.MarkPaths(plannedNewVal, marks.Sensitive, sensitivePaths)
 	}
 
@@ -339,8 +343,8 @@ func (n *nodePlannablePartialExpandedResource) dataResourceExecute(ctx EvalConte
 	// This is the point where we switch to mirroring logic from
 	// NodeAbstractResourceInstance's planDataSource. If you were curious.
 
-	schema, _ := providerSchema.SchemaForResourceAddr(n.addr.Resource())
-	if schema == nil {
+	schema := providerSchema.SchemaForResourceAddr(n.addr.Resource())
+	if schema.Body == nil {
 		// Should be caught during validation, so we don't bother with a pretty error here
 		diags = diags.Append(fmt.Errorf("provider does not support resource type %q", n.addr.Resource().Type))
 		return &change, diags
@@ -348,9 +352,16 @@ func (n *nodePlannablePartialExpandedResource) dataResourceExecute(ctx EvalConte
 
 	keyData := n.keyData()
 
-	configVal, _, configDiags := ctx.EvaluateBlock(n.config.Config, schema, nil, keyData)
+	configVal, _, configDiags := ctx.EvaluateBlock(n.config.Config, schema.Body, nil, keyData)
 	diags = diags.Append(configDiags)
 	if configDiags.HasErrors() {
+		return &change, diags
+	}
+
+	var deprecationDiags tfdiags.Diagnostics
+	configVal, deprecationDiags = ctx.Deprecations().ValidateAndUnmarkConfig(configVal, schema.Body, n.ResourceAddr().Module)
+	diags = diags.Append(deprecationDiags.InConfigBody(n.config.Config, n.addr.String()))
+	if diags.HasErrors() {
 		return &change, diags
 	}
 
@@ -369,9 +380,9 @@ func (n *nodePlannablePartialExpandedResource) dataResourceExecute(ctx EvalConte
 	// logic for a data source with unknown config, which is sort of what we
 	// are, after all.
 	unmarkedConfigVal, unmarkedPaths := configVal.UnmarkDeepWithPaths()
-	proposedNewVal := objchange.PlannedDataResourceObject(schema, unmarkedConfigVal)
+	proposedNewVal := objchange.PlannedDataResourceObject(schema.Body, unmarkedConfigVal)
 	proposedNewVal = proposedNewVal.MarkWithPaths(unmarkedPaths)
-	if sensitivePaths := schema.SensitivePaths(proposedNewVal, nil); len(sensitivePaths) != 0 {
+	if sensitivePaths := schema.Body.SensitivePaths(proposedNewVal, nil); len(sensitivePaths) != 0 {
 		proposedNewVal = marks.MarkPaths(proposedNewVal, marks.Sensitive, sensitivePaths)
 	}
 	// yay we made it

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package convert
@@ -21,6 +21,8 @@ var ignoreUnexported = cmpopts.IgnoreUnexported(
 	proto.Schema_Block{},
 	proto.Schema_NestedBlock{},
 	proto.Schema_Attribute{},
+	proto.ResourceIdentitySchema{},
+	proto.ResourceIdentitySchema_IdentityAttribute{},
 )
 
 func TestProtoDiagnostics(t *testing.T) {

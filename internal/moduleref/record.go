@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package moduleref
@@ -7,8 +7,6 @@ import (
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/terraform/internal/addrs"
 )
-
-const FormatVersion = "1.0"
 
 // ModuleRecord is the implementation of a module entry defined in the module
 // manifest that is declared by configuration.
@@ -20,11 +18,10 @@ type Record struct {
 	Children           Records
 }
 
-// ModuleRecordManifest is the view implementation of module entries declared
+// Manifest describes all module entries declared
 // in configuration
 type Manifest struct {
-	FormatVersion string
-	Records       Records
+	Records Records
 }
 
 func (m *Manifest) addModuleEntry(entry *Record) {
@@ -40,9 +37,11 @@ type Records []*Record
 func (r Records) Len() int {
 	return len(r)
 }
+
 func (r Records) Less(i, j int) bool {
 	return r[i].Key < r[j].Key
 }
+
 func (r Records) Swap(i, j int) {
 	r[i], r[j] = r[j], r[i]
 }

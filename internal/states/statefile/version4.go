@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package statefile
@@ -87,7 +87,6 @@ func prepareStateV4(sV4 *stateV4) (*File, tfdiags.Diagnostics) {
 		}
 
 		providerAddr, addrDiags := addrs.ParseAbsProviderConfigStr(rsV4.ProviderConfig)
-		diags.Append(addrDiags)
 		if addrDiags.HasErrors() {
 			// If ParseAbsProviderConfigStr returns an error, the state may have
 			// been written before Provider FQNs were introduced and the
@@ -97,6 +96,9 @@ func prepareStateV4(sV4 *stateV4) (*File, tfdiags.Diagnostics) {
 			var legacyAddrDiags tfdiags.Diagnostics
 			providerAddr, legacyAddrDiags = addrs.ParseLegacyAbsProviderConfigStr(rsV4.ProviderConfig)
 			if legacyAddrDiags.HasErrors() {
+				// Perhaps it wasn't a legacy string format after all; return
+				// the original error to the caller
+				diags = diags.Append(addrDiags)
 				continue
 			}
 		}
@@ -136,8 +138,9 @@ func prepareStateV4(sV4 *stateV4) (*File, tfdiags.Diagnostics) {
 			instAddr := rAddr.Instance(key)
 
 			obj := &states.ResourceInstanceObjectSrc{
-				SchemaVersion:       isV4.SchemaVersion,
-				CreateBeforeDestroy: isV4.CreateBeforeDestroy,
+				SchemaVersion:         isV4.SchemaVersion,
+				CreateBeforeDestroy:   isV4.CreateBeforeDestroy,
+				IdentitySchemaVersion: isV4.IdentitySchemaVersion,
 			}
 
 			{
@@ -154,6 +157,10 @@ func prepareStateV4(sV4 *stateV4) (*File, tfdiags.Diagnostics) {
 					// to hand-write inline in tests.
 					obj.AttrsJSON = []byte{'{', '}'}
 				}
+			}
+
+			if isV4.IdentityRaw != nil {
+				obj.IdentityJSON = isV4.IdentityRaw
 			}
 
 			// Sensitive paths
@@ -494,6 +501,8 @@ func appendInstanceObjectStateV4(rs *states.Resource, is *states.ResourceInstanc
 		PrivateRaw:              privateRaw,
 		Dependencies:            deps,
 		CreateBeforeDestroy:     obj.CreateBeforeDestroy,
+		IdentitySchemaVersion:   obj.IdentitySchemaVersion,
+		IdentityRaw:             obj.IdentityJSON,
 	}), diags
 }
 
@@ -701,6 +710,9 @@ type instanceObjectStateV4 struct {
 	AttributesRaw           json.RawMessage   `json:"attributes,omitempty"`
 	AttributesFlat          map[string]string `json:"attributes_flat,omitempty"`
 	AttributeSensitivePaths json.RawMessage   `json:"sensitive_attributes,omitempty"`
+
+	IdentitySchemaVersion uint64          `json:"identity_schema_version"`
+	IdentityRaw           json.RawMessage `json:"identity,omitempty"`
 
 	PrivateRaw []byte `json:"private,omitempty"`
 

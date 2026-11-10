@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package views
@@ -16,10 +16,12 @@ import (
 // countHook is a hook that counts the number of resources
 // added, removed, changed during the course of an apply.
 type countHook struct {
-	Added    int
-	Changed  int
-	Removed  int
-	Imported int
+	Added            int
+	Changed          int
+	Removed          int
+	Imported         int
+	ActionInvocation int
+	ActionFail       int
 
 	ToAdd          int
 	ToChange       int
@@ -33,17 +35,6 @@ type countHook struct {
 }
 
 var _ terraform.Hook = (*countHook)(nil)
-
-func (h *countHook) Reset() {
-	h.Lock()
-	defer h.Unlock()
-
-	h.pending = nil
-	h.Added = 0
-	h.Changed = 0
-	h.Removed = 0
-	h.Imported = 0
-}
 
 func (h *countHook) PreApply(id terraform.HookResourceIdentity, dk addrs.DeposedKey, action plans.Action, priorState, plannedNewState cty.Value) (terraform.HookAction, error) {
 	h.Lock()
@@ -72,6 +63,8 @@ func (h *countHook) PostApply(id terraform.HookResourceIdentity, dk addrs.Depose
 				case plans.CreateThenDelete, plans.DeleteThenCreate:
 					h.Added++
 					h.Removed++
+				case plans.ForgetThenCreate, plans.CreateThenForget:
+					h.Added++
 				case plans.Create:
 					h.Added++
 				case plans.Delete:
@@ -86,9 +79,14 @@ func (h *countHook) PostApply(id terraform.HookResourceIdentity, dk addrs.Depose
 	return terraform.HookActionContinue, nil
 }
 
-func (h *countHook) PostDiff(id terraform.HookResourceIdentity, dk addrs.DeposedKey, action plans.Action, priorState, plannedNewState cty.Value) (terraform.HookAction, error) {
+func (h *countHook) PostDiff(id terraform.HookResourceIdentity, dk addrs.DeposedKey, action plans.Action, err error) (terraform.HookAction, error) {
 	h.Lock()
 	defer h.Unlock()
+
+	// Skip counting if there was an error
+	if err != nil {
+		return terraform.HookActionContinue, nil
+	}
 
 	// We don't count anything for data resources
 	if id.Addr.Resource.Resource.Mode == addrs.DataResourceMode {
@@ -98,6 +96,8 @@ func (h *countHook) PostDiff(id terraform.HookResourceIdentity, dk addrs.Deposed
 	switch action {
 	case plans.CreateThenDelete, plans.DeleteThenCreate:
 		h.ToRemoveAndAdd += 1
+	case plans.ForgetThenCreate, plans.CreateThenForget:
+		h.ToAdd += 1
 	case plans.Create:
 		h.ToAdd += 1
 	case plans.Delete:
@@ -114,5 +114,16 @@ func (h *countHook) PostApplyImport(id terraform.HookResourceIdentity, importing
 	defer h.Unlock()
 
 	h.Imported++
+	return terraform.HookActionContinue, nil
+}
+
+func (h *countHook) CompleteAction(id terraform.HookActionIdentity, err error) (terraform.HookAction, error) {
+	h.Lock()
+	defer h.Unlock()
+	h.ActionInvocation++
+	if err != nil {
+		h.ActionFail++
+	}
+
 	return terraform.HookActionContinue, nil
 }

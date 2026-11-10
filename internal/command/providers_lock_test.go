@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -11,8 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/cli"
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/backend"
+	backendInit "github.com/hashicorp/terraform/internal/backend/init"
+	backendCloud "github.com/hashicorp/terraform/internal/cloud"
 	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/getproviders"
 )
@@ -23,12 +25,12 @@ func TestProvidersLock(t *testing.T) {
 		// create an empty working directory
 		td := t.TempDir()
 		os.MkdirAll(td, 0755)
-		defer testChdir(t, td)()
+		t.Chdir(td)
 
-		ui := new(cli.MockUi)
+		view, _ := testView(t)
 		c := &ProvidersLockCommand{
 			Meta: Meta{
-				Ui: ui,
+				View: view,
 			},
 		}
 		code := c.Run([]string{})
@@ -50,7 +52,7 @@ provider "registry.terraform.io/hashicorp/test" {
   ]
 }
 `
-		runProviderLockGenericTest(t, testDirectory, expected)
+		runProviderLockGenericTest(t, testDirectory, expected, false)
 	})
 
 	// This test depends on the -fs-mirror argument, so we always know what results to expect
@@ -67,14 +69,30 @@ provider "registry.terraform.io/hashicorp/test" {
   ]
 }
 `
-		runProviderLockGenericTest(t, testDirectory, expected)
+		runProviderLockGenericTest(t, testDirectory, expected, false)
+	})
+
+	// This test depends on the -fs-mirror argument, so we always know what results to expect
+	t.Run("tests", func(t *testing.T) {
+		testDirectory := "providers-lock/with-tests"
+		expected := `# This file is maintained automatically by "terraform init".
+# Manual edits may be lost in future updates.
+
+provider "registry.terraform.io/hashicorp/test" {
+  version = "1.0.0"
+  hashes = [
+    "h1:7MjN4eFisdTv4tlhXH5hL4QQd39Jy4baPhFxwAd/EFE=",
+  ]
+}
+`
+		runProviderLockGenericTest(t, testDirectory, expected, true)
 	})
 }
 
-func runProviderLockGenericTest(t *testing.T, testDirectory, expected string) {
+func runProviderLockGenericTest(t *testing.T, testDirectory, expected string, init bool) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath(testDirectory), td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	// Our fixture dir has a generic os_arch dir, which we need to customize
 	// to the actual OS/arch where this test is running in order to get the
@@ -86,11 +104,26 @@ func runProviderLockGenericTest(t *testing.T, testDirectory, expected string) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
+	if init {
+		// optionally execute the get command to fetch local modules if the
+		// test case needs them
+		view, done := testView(t)
+		c := &GetCommand{
+			Meta: Meta{
+				View: view,
+			},
+		}
+		code := c.Run(nil)
+		if code != 0 {
+			t.Fatalf("failed get command: %s", done(t).All())
+		}
+	}
+
 	p := testProvider()
-	ui := new(cli.MockUi)
+	view, _ := testView(t)
 	c := &ProvidersLockCommand{
 		Meta: Meta{
-			Ui:               ui,
+			View:             view,
 			testingOverrides: metaOverridesForProvider(p),
 		},
 	}
@@ -111,18 +144,103 @@ func runProviderLockGenericTest(t *testing.T, testDirectory, expected string) {
 	}
 }
 
-func TestProvidersLock_args(t *testing.T) {
+func TestProvidersLock_constVariable(t *testing.T) {
+	t.Run("missing value", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/get-const-var")
+		t.Chdir(wd.RootModuleDir())
 
-	t.Run("mirror collision", func(t *testing.T) {
-		ui := new(cli.MockUi)
+		view, _ := testView(t)
 		c := &ProvidersLockCommand{
 			Meta: Meta{
-				Ui: ui,
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				View:             view,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{"-fs-mirror=fs-mirror"}
+		if code := c.Run(args); code == 0 {
+			t.Fatalf("expected error, got 0")
+		}
+	})
+
+	t.Run("value via cli", func(t *testing.T) {
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/get-const-var")
+		t.Chdir(wd.RootModuleDir())
+
+		view, done := testView(t)
+		c := &ProvidersLockCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				View:             view,
+				WorkingDir:       wd,
+			},
+		}
+
+		args := []string{
+			"-no-color",
+			"-var", "module_name=example",
+			"-fs-mirror=fs-mirror",
+		}
+		if code := c.Run(args); code == 0 {
+			t.Fatalf("expected command to proceed past const variable resolution")
+		}
+
+		output := done(t)
+		if !strings.Contains(output.Stderr(), "Error: Module not installed") {
+			t.Fatalf("expected module installation diagnostic, got: %s", output.All())
+		}
+	})
+
+	t.Run("value via backend", func(t *testing.T) {
+		server := cloudTestServerWithVars(t)
+		defer server.Close()
+		d := testDisco(server)
+
+		previousBackend := backendInit.Backend("cloud")
+		backendInit.Set("cloud", func() backend.Backend { return backendCloud.New(d) })
+		defer backendInit.Set("cloud", previousBackend)
+
+		wd := tempWorkingDirFixture(t, "dynamic-module-sources/get-const-var-backend")
+		t.Chdir(wd.RootModuleDir())
+
+		view, done := testView(t)
+		c := &ProvidersLockCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(testProvider()),
+				View:             view,
+				WorkingDir:       wd,
+				Services:         d,
+			},
+		}
+
+		args := []string{
+			"-no-color",
+			"-fs-mirror=fs-mirror",
+		}
+		if code := c.Run(args); code == 0 {
+			t.Fatalf("expected command to proceed past const variable resolution")
+		}
+
+		output := done(t)
+		if !strings.Contains(output.Stderr(), "Error: Module not installed") {
+			t.Fatalf("expected module installation diagnostic, got: %s", output.All())
+		}
+	})
+}
+
+func TestProvidersLock_args(t *testing.T) {
+	t.Run("mirror collision", func(t *testing.T) {
+		view, done := testView(t)
+		c := &ProvidersLockCommand{
+			Meta: Meta{
+				View: view,
 			},
 		}
 
 		// only one of these arguments can be used at a time
 		args := []string{
+			"-no-color",
 			"-fs-mirror=/foo/",
 			"-net-mirror=www.foo.com",
 		}
@@ -131,51 +249,57 @@ func TestProvidersLock_args(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("wrong exit code; expected 1, got %d", code)
 		}
-		output := ui.ErrorWriter.String()
-		if !strings.Contains(output, "The -fs-mirror and -net-mirror command line options are mutually-exclusive.") {
-			t.Fatalf("missing expected error message: %s", output)
+		output := done(t)
+		if !strings.Contains(output.Stderr(), "The -fs-mirror and -net-mirror command line options are mutually-exclusive.") {
+			t.Fatalf("missing expected error message: %s", output.All())
 		}
 	})
 
 	t.Run("invalid platform", func(t *testing.T) {
-		ui := new(cli.MockUi)
+		view, done := testView(t)
 		c := &ProvidersLockCommand{
 			Meta: Meta{
-				Ui: ui,
+				View: view,
 			},
 		}
 
 		// not a valid platform
-		args := []string{"-platform=arbitrary_nonsense_that_isnt_valid"}
+		args := []string{
+			"-no-color",
+			"-platform=arbitrary_nonsense_that_isnt_valid",
+		}
 		code := c.Run(args)
 
 		if code != 1 {
 			t.Fatalf("wrong exit code; expected 1, got %d", code)
 		}
-		output := ui.ErrorWriter.String()
-		if !strings.Contains(output, "must be two words separated by an underscore.") {
-			t.Fatalf("missing expected error message: %s", output)
+		output := done(t)
+		if !strings.Contains(output.Stderr(), "must be two words separated by an underscore.") {
+			t.Fatalf("missing expected error message: %s", output.All())
 		}
 	})
 
 	t.Run("invalid provider argument", func(t *testing.T) {
-		ui := new(cli.MockUi)
+		view, done := testView(t)
 		c := &ProvidersLockCommand{
 			Meta: Meta{
-				Ui: ui,
+				View: view,
 			},
 		}
 
 		// There is no configuration, so it's not valid to use any provider argument
-		args := []string{"hashicorp/random"}
+		args := []string{
+			"-no-color",
+			"hashicorp/random",
+		}
 		code := c.Run(args)
 
 		if code != 1 {
 			t.Fatalf("wrong exit code; expected 1, got %d", code)
 		}
-		output := ui.ErrorWriter.String()
-		if !strings.Contains(output, "The provider registry.terraform.io/hashicorp/random is not required by the\ncurrent configuration.") {
-			t.Fatalf("missing expected error message: %s", output)
+		output := done(t)
+		if !strings.Contains(output.Stderr(), "The provider registry.terraform.io/hashicorp/random is not required by the\ncurrent configuration.") {
+			t.Fatalf("missing expected error message: %s", output.All())
 		}
 	})
 }

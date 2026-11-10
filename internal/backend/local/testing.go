@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package local
@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/states/statemgr"
 	"github.com/hashicorp/terraform/internal/terraform"
+	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
 // TestLocal returns a configured Local struct with temporary paths and
@@ -57,19 +58,19 @@ func TestLocalProvider(t *testing.T, b *Local, name string, schema providers.Pro
 			return resp
 		}
 
-		rSchema, _ := schema.SchemaForResourceType(addrs.ManagedResourceMode, req.TypeName)
-		if rSchema == nil {
-			rSchema = &configschema.Block{} // default schema is empty
+		rSchema := schema.SchemaForResourceType(addrs.ManagedResourceMode, req.TypeName)
+		if rSchema.Body == nil {
+			rSchema.Body = &configschema.Block{} // default schema is empty
 		}
 		plannedVals := map[string]cty.Value{}
-		for name, attrS := range rSchema.Attributes {
+		for name, attrS := range rSchema.Body.Attributes {
 			val := req.ProposedNewState.GetAttr(name)
 			if attrS.Computed && val.IsNull() {
 				val = cty.UnknownVal(attrS.Type)
 			}
 			plannedVals[name] = val
 		}
-		for name := range rSchema.BlockTypes {
+		for name := range rSchema.Body.BlockTypes {
 			// For simplicity's sake we just copy the block attributes over
 			// verbatim, since this package's mock providers are all relatively
 			// simple -- we're testing the backend, not esoteric provider features.
@@ -99,7 +100,6 @@ func TestLocalProvider(t *testing.T, b *Local, name string, schema providers.Pro
 	}
 
 	return p
-
 }
 
 // TestLocalSingleState is a backend implementation that wraps Local
@@ -118,17 +118,18 @@ func TestNewLocalSingle() backend.Backend {
 	return &TestLocalSingleState{Local: New()}
 }
 
-func (b *TestLocalSingleState) Workspaces() ([]string, error) {
-	return nil, backend.ErrWorkspacesNotSupported
+func (b *TestLocalSingleState) Workspaces() ([]string, tfdiags.Diagnostics) {
+	return nil, tfdiags.Diagnostics{}.Append(backend.ErrWorkspacesNotSupported)
 }
 
-func (b *TestLocalSingleState) DeleteWorkspace(string, bool) error {
-	return backend.ErrWorkspacesNotSupported
+func (b *TestLocalSingleState) DeleteWorkspace(string, bool) tfdiags.Diagnostics {
+	return tfdiags.Diagnostics{}.Append(backend.ErrWorkspacesNotSupported)
 }
 
-func (b *TestLocalSingleState) StateMgr(name string) (statemgr.Full, error) {
+func (b *TestLocalSingleState) StateMgr(name string) (statemgr.Full, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
 	if name != backend.DefaultStateName {
-		return nil, backend.ErrWorkspacesNotSupported
+		return nil, diags.Append(backend.ErrWorkspacesNotSupported)
 	}
 
 	return b.Local.StateMgr(name)
@@ -148,10 +149,12 @@ func TestNewLocalNoDefault() backend.Backend {
 	return &TestLocalNoDefaultState{Local: New()}
 }
 
-func (b *TestLocalNoDefaultState) Workspaces() ([]string, error) {
-	workspaces, err := b.Local.Workspaces()
-	if err != nil {
-		return nil, err
+func (b *TestLocalNoDefaultState) Workspaces() ([]string, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+	workspaces, wDiags := b.Local.Workspaces()
+	diags = diags.Append(wDiags)
+	if wDiags.HasErrors() {
+		return nil, diags
 	}
 
 	filtered := workspaces[:0]
@@ -161,19 +164,20 @@ func (b *TestLocalNoDefaultState) Workspaces() ([]string, error) {
 		}
 	}
 
-	return filtered, nil
+	return filtered, diags
 }
 
-func (b *TestLocalNoDefaultState) DeleteWorkspace(name string, force bool) error {
+func (b *TestLocalNoDefaultState) DeleteWorkspace(name string, force bool) tfdiags.Diagnostics {
 	if name == backend.DefaultStateName {
-		return backend.ErrDefaultWorkspaceNotSupported
+		return tfdiags.Diagnostics{}.Append(backend.ErrDefaultWorkspaceNotSupported)
 	}
 	return b.Local.DeleteWorkspace(name, force)
 }
 
-func (b *TestLocalNoDefaultState) StateMgr(name string) (statemgr.Full, error) {
+func (b *TestLocalNoDefaultState) StateMgr(name string) (statemgr.Full, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
 	if name == backend.DefaultStateName {
-		return nil, backend.ErrDefaultWorkspaceNotSupported
+		return nil, diags.Append(backend.ErrDefaultWorkspaceNotSupported)
 	}
 	return b.Local.StateMgr(name)
 }

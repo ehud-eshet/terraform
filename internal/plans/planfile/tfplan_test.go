@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package planfile
@@ -8,25 +8,229 @@ import (
 	"testing"
 
 	"github.com/go-test/deep"
+	version "github.com/hashicorp/go-version"
+	tfaddr "github.com/hashicorp/terraform-registry-address"
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
 	"github.com/hashicorp/terraform/internal/collections"
+	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/lang/globalref"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 )
 
+func TestActionProtoRoundTrip_forgetThenCreate(t *testing.T) {
+	before, err := plans.NewDynamicValue(cty.StringVal("before"), cty.String)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := plans.NewDynamicValue(cty.StringVal("after"), cty.String)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := changeToTfplan(&plans.ChangeSrc{
+		Action: plans.ForgetThenCreate,
+		Before: before,
+		After:  after,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := changeFromTfplan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Action != plans.ForgetThenCreate {
+		t.Fatalf("wrong action after round trip: got %s, want %s", got.Action, plans.ForgetThenCreate)
+	}
+	if !bytes.Equal(got.Before, before) {
+		t.Fatalf("wrong before value after round trip")
+	}
+	if !bytes.Equal(got.After, after) {
+		t.Fatalf("wrong after value after round trip")
+	}
+}
+
+// TestTFPlanRoundTrip writes a plan to a planfile, reads the contents of the planfile,
+// and asserts that the read data matches the written data.
 func TestTFPlanRoundTrip(t *testing.T) {
+	cases := map[string]struct {
+		plan *plans.Plan
+	}{
+		"round trip with backend": {
+			plan: func() *plans.Plan {
+				rawPlan := examplePlanForTest(t)
+				return rawPlan
+			}(),
+		},
+		"round trip with state store": {
+			plan: func() *plans.Plan {
+				rawPlan := examplePlanForTest(t)
+				// remove backend data from example plan
+				rawPlan.Backend = nil
+
+				// add state store instead
+				ver, err := version.NewVersion("9.9.9")
+				if err != nil {
+					t.Fatalf("error encountered during test setup: %s", err)
+				}
+
+				// add state store instead
+				rawPlan.StateStore = &plans.StateStore{
+					Type: "foo_bar",
+					Provider: &plans.Provider{
+						Version: ver,
+						Source: &tfaddr.Provider{
+							Hostname:  tfaddr.DefaultProviderRegistryHost,
+							Namespace: "foobar",
+							Type:      "foo",
+						},
+						// Imagining a provider that has nothing in its schema
+						Config: mustNewDynamicValue(
+							cty.EmptyObjectVal,
+							cty.Object(nil),
+						),
+					},
+					// Imagining a state store with a field called `foo` in its schema
+					Config: mustNewDynamicValue(
+						cty.ObjectVal(map[string]cty.Value{
+							"foo": cty.StringVal("bar"),
+						}),
+						cty.Object(map[string]cty.Type{
+							"foo": cty.String,
+						}),
+					),
+					Workspace: "default",
+				}
+				return rawPlan
+			}(),
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := writeTfplan(tc.plan, &buf)
+			if err != nil {
+				t.Fatalf("unexpected err: %s", err)
+			}
+
+			newPlan, err := readTfplan(&buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			{
+				oldDepth := deep.MaxDepth
+				oldCompare := deep.CompareUnexportedFields
+				deep.MaxDepth = 20
+				deep.CompareUnexportedFields = true
+				defer func() {
+					deep.MaxDepth = oldDepth
+					deep.CompareUnexportedFields = oldCompare
+				}()
+			}
+			for _, problem := range deep.Equal(newPlan, tc.plan) {
+				t.Error(problem)
+			}
+		})
+	}
+}
+
+func Test_writeTfplan_validation(t *testing.T) {
+	cases := map[string]struct {
+		plan            *plans.Plan
+		wantWriteErrMsg string
+	}{
+		"error when missing both backend and state store": {
+			plan: func() *plans.Plan {
+				rawPlan := examplePlanForTest(t)
+				// remove backend from example plan
+				rawPlan.Backend = nil
+				return rawPlan
+			}(),
+			wantWriteErrMsg: "plan does not have a backend or state_store configuration",
+		},
+		"error when got both backend and state store": {
+			plan: func() *plans.Plan {
+				rawPlan := examplePlanForTest(t)
+				// Backend is already set on example plan
+
+				// Add state store in parallel
+				ver, err := version.NewVersion("9.9.9")
+				if err != nil {
+					t.Fatalf("error encountered during test setup: %s", err)
+				}
+				rawPlan.StateStore = &plans.StateStore{
+					Type: "foo_bar",
+					Provider: &plans.Provider{
+						Version: ver,
+						Source: &tfaddr.Provider{
+							Hostname:  tfaddr.DefaultProviderRegistryHost,
+							Namespace: "foobar",
+							Type:      "foo",
+						},
+						Config: mustNewDynamicValue(
+							cty.ObjectVal(map[string]cty.Value{
+								"foo": cty.StringVal("bar"),
+							}),
+							cty.Object(map[string]cty.Type{
+								"foo": cty.String,
+							}),
+						),
+					},
+					Config: mustNewDynamicValue(
+						cty.ObjectVal(map[string]cty.Value{
+							"foo": cty.StringVal("bar"),
+						}),
+						cty.Object(map[string]cty.Type{
+							"foo": cty.String,
+						}),
+					),
+					Workspace: "default",
+				}
+				return rawPlan
+			}(),
+			wantWriteErrMsg: "plan contains both backend and state_store configurations, only one is expected",
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := writeTfplan(tc.plan, &buf)
+			if err == nil {
+				t.Fatal("this test expects an error but got none")
+			}
+			if err.Error() != tc.wantWriteErrMsg {
+				t.Fatalf("unexpected error message: wanted %q, got %q", tc.wantWriteErrMsg, err)
+			}
+		})
+	}
+}
+
+// examplePlanForTest returns a plans.Plan struct pointer that can be used
+// when setting up tests. The returned plan can be mutated depending on the
+// test case.
+func examplePlanForTest(t *testing.T) *plans.Plan {
+	t.Helper()
 	objTy := cty.Object(map[string]cty.Type{
 		"id": cty.String,
 	})
 	applyTimeVariables := collections.NewSetCmp[string]()
 	applyTimeVariables.Add("bar")
 
-	plan := &plans.Plan{
+	provider := addrs.AbsProviderConfig{
+		Provider: addrs.NewDefaultProvider("test"),
+		Module:   addrs.RootModule,
+	}
+
+	return &plans.Plan{
 		Applyable: true,
 		Complete:  true,
 		VariableValues: map[string]plans.DynamicValue{
@@ -74,10 +278,7 @@ func TestTFPlanRoundTrip(t *testing.T) {
 						Type: "test_thing",
 						Name: "woot",
 					}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
-					ProviderAddr: addrs.AbsProviderConfig{
-						Provider: addrs.NewDefaultProvider("test"),
-						Module:   addrs.RootModule,
-					},
+					ProviderAddr: provider,
 					ChangeSrc: plans.ChangeSrc{
 						Action: plans.DeleteThenCreate,
 						Before: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
@@ -136,10 +337,7 @@ func TestTFPlanRoundTrip(t *testing.T) {
 						Type: "test_thing",
 						Name: "importing",
 					}.Instance(addrs.IntKey(1)).Absolute(addrs.RootModuleInstance),
-					ProviderAddr: addrs.AbsProviderConfig{
-						Provider: addrs.NewDefaultProvider("test"),
-						Module:   addrs.RootModule,
-					},
+					ProviderAddr: provider,
 					ChangeSrc: plans.ChangeSrc{
 						Action: plans.NoOp,
 						Before: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
@@ -151,6 +349,57 @@ func TestTFPlanRoundTrip(t *testing.T) {
 						Importing:       &plans.ImportingSrc{ID: "testing"},
 						GeneratedConfig: "resource \\\"test_thing\\\" \\\"importing\\\" {}",
 					},
+				},
+			},
+			ActionInvocations: []*plans.ActionInvocationInstanceSrc{
+				{
+					Addr:         addrs.Action{Type: "example", Name: "foo"}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+					ProviderAddr: provider,
+					ActionTrigger: &plans.ResourceActionTrigger{
+						ActionTriggerEvent:      configs.BeforeCreate,
+						ActionTriggerBlockIndex: 2,
+						ActionsListIndex:        0,
+						TriggeringResourceAddr: addrs.Resource{
+							Mode: addrs.ManagedResourceMode,
+							Type: "test_thing",
+							Name: "woot",
+						}.Instance(addrs.IntKey(0)).Absolute(addrs.RootModuleInstance),
+					},
+				},
+				{
+					Addr:         addrs.Action{Type: "example", Name: "bar"}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+					ProviderAddr: provider,
+					ActionTrigger: &plans.ResourceActionTrigger{
+						ActionTriggerEvent:      configs.BeforeCreate,
+						ActionTriggerBlockIndex: 2,
+						ActionsListIndex:        1,
+						TriggeringResourceAddr: addrs.Resource{
+							Mode: addrs.ManagedResourceMode,
+							Type: "test_thing",
+							Name: "woot",
+						}.Instance(addrs.IntKey(0)).Absolute(addrs.RootModuleInstance),
+					},
+					ConfigValue: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
+						"id": cty.StringVal("testing"),
+					}), objTy),
+				},
+				{
+					Addr:         addrs.Action{Type: "example", Name: "baz"}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+					ProviderAddr: provider,
+					ActionTrigger: &plans.ResourceActionTrigger{
+						ActionTriggerEvent:      configs.BeforeCreate,
+						ActionTriggerBlockIndex: 2,
+						ActionsListIndex:        1,
+						TriggeringResourceAddr: addrs.Resource{
+							Mode: addrs.ManagedResourceMode,
+							Type: "test_thing",
+							Name: "woot",
+						}.Instance(addrs.IntKey(0)).Absolute(addrs.RootModuleInstance),
+					},
+					ConfigValue: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
+						"id": cty.StringVal("secret"),
+					}), objTy),
+					SensitiveConfigPaths: []cty.Path{cty.GetAttrPath("id")},
 				},
 			},
 		},
@@ -166,10 +415,7 @@ func TestTFPlanRoundTrip(t *testing.T) {
 					Type: "test_thing",
 					Name: "woot",
 				}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
-				ProviderAddr: addrs.AbsProviderConfig{
-					Provider: addrs.NewDefaultProvider("test"),
-					Module:   addrs.RootModule,
-				},
+				ProviderAddr: provider,
 				ChangeSrc: plans.ChangeSrc{
 					Action: plans.DeleteThenCreate,
 					Before: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
@@ -200,10 +446,7 @@ func TestTFPlanRoundTrip(t *testing.T) {
 						Type: "test_thing",
 						Name: "woot",
 					}.Instance(addrs.WildcardKey).Absolute(addrs.RootModuleInstance),
-					ProviderAddr: addrs.AbsProviderConfig{
-						Provider: addrs.NewDefaultProvider("test"),
-						Module:   addrs.RootModule,
-					},
+					ProviderAddr: provider,
 					ChangeSrc: plans.ChangeSrc{
 						Action: plans.Create,
 						After: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
@@ -229,10 +472,7 @@ func TestTFPlanRoundTrip(t *testing.T) {
 							InstanceKey: addrs.WildcardKey,
 						},
 					}),
-					ProviderAddr: addrs.AbsProviderConfig{
-						Provider: addrs.NewDefaultProvider("test"),
-						Module:   addrs.RootModule,
-					},
+					ProviderAddr: provider,
 					ChangeSrc: plans.ChangeSrc{
 						Action: plans.Create,
 						After: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
@@ -243,6 +483,30 @@ func TestTFPlanRoundTrip(t *testing.T) {
 							}),
 						}), objTy),
 					},
+				},
+			},
+		},
+		DeferredActionInvocations: []*plans.DeferredActionInvocationSrc{
+			{
+				DeferredReason: providers.DeferredReasonDeferredPrereq,
+				ActionInvocationInstanceSrc: &plans.ActionInvocationInstanceSrc{
+					Addr: addrs.Action{Type: "test_action", Name: "example"}.Absolute(addrs.RootModuleInstance).Instance(addrs.NoKey),
+					ActionTrigger: &plans.ResourceActionTrigger{
+						TriggeringResourceAddr: addrs.Resource{
+							Mode: addrs.ManagedResourceMode,
+							Type: "test_thing",
+							Name: "woot",
+						}.Instance(addrs.IntKey(0)).Absolute(addrs.RootModuleInstance),
+						ActionTriggerBlockIndex: 1,
+						ActionsListIndex:        2,
+						ActionTriggerEvent:      configs.AfterCreate,
+					},
+					ProviderAddr: provider,
+					ConfigValue: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
+						"attr": cty.StringVal("value"),
+					}), cty.Object(map[string]cty.Type{
+						"attr": cty.String,
+					})),
 				},
 			},
 		},
@@ -302,14 +566,10 @@ func TestTFPlanRoundTrip(t *testing.T) {
 				),
 			),
 		},
-		TargetAddrs: []addrs.Targetable{
-			addrs.Resource{
-				Mode: addrs.ManagedResourceMode,
-				Type: "test_thing",
-				Name: "woot",
-			}.Absolute(addrs.RootModuleInstance),
+		TargetAddrs: []addrs.TargetPattern{
+			mustParseTargetPattern("test_thing.woot"),
 		},
-		Backend: plans.Backend{
+		Backend: &plans.Backend{
 			Type: "local",
 			Config: mustNewDynamicValue(
 				cty.ObjectVal(map[string]cty.Value{
@@ -321,31 +581,6 @@ func TestTFPlanRoundTrip(t *testing.T) {
 			),
 			Workspace: "default",
 		},
-	}
-
-	var buf bytes.Buffer
-	err := writeTfplan(plan, &buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	newPlan, err := readTfplan(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	{
-		oldDepth := deep.MaxDepth
-		oldCompare := deep.CompareUnexportedFields
-		deep.MaxDepth = 20
-		deep.CompareUnexportedFields = true
-		defer func() {
-			deep.MaxDepth = oldDepth
-			deep.CompareUnexportedFields = oldCompare
-		}()
-	}
-	for _, problem := range deep.Equal(newPlan, plan) {
-		t.Error(problem)
 	}
 }
 
@@ -374,12 +609,31 @@ func mustNewDynamicValueStr(val string) plans.DynamicValue {
 	return ret
 }
 
+func mustParseTargetPattern(str string) addrs.TargetPattern {
+	target, diags := addrs.ParseTargetStr(str)
+	if diags.HasErrors() {
+		panic(diags.Err())
+	}
+	return target
+}
+
 // TestTFPlanRoundTripDestroy ensures that encoding and decoding null values for
 // destroy doesn't leave us with any nil values.
 func TestTFPlanRoundTripDestroy(t *testing.T) {
 	objTy := cty.Object(map[string]cty.Type{
 		"id": cty.String,
 	})
+
+	objSchema := providers.Schema{
+		Body: &configschema.Block{
+			Attributes: map[string]*configschema.Attribute{
+				"id": {
+					Type:     cty.String,
+					Required: true,
+				},
+			},
+		},
+	}
 
 	plan := &plans.Plan{
 		Changes: &plans.ChangesSrc{
@@ -420,14 +674,10 @@ func TestTFPlanRoundTripDestroy(t *testing.T) {
 			},
 		},
 		DriftedResources: []*plans.ResourceInstanceChangeSrc{},
-		TargetAddrs: []addrs.Targetable{
-			addrs.Resource{
-				Mode: addrs.ManagedResourceMode,
-				Type: "test_thing",
-				Name: "woot",
-			}.Absolute(addrs.RootModuleInstance),
+		TargetAddrs: []addrs.TargetPattern{
+			mustParseTargetPattern("test_thing.woot"),
 		},
-		Backend: plans.Backend{
+		Backend: &plans.Backend{
 			Type: "local",
 			Config: mustNewDynamicValue(
 				cty.ObjectVal(map[string]cty.Value{
@@ -453,7 +703,7 @@ func TestTFPlanRoundTripDestroy(t *testing.T) {
 	}
 
 	for _, rics := range newPlan.Changes.Resources {
-		ric, err := rics.Decode(objTy)
+		ric, err := rics.Decode(objSchema)
 		if err != nil {
 			t.Fatal(err)
 		}

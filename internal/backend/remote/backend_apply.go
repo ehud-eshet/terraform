@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package remote
@@ -14,6 +14,7 @@ import (
 	version "github.com/hashicorp/go-version"
 
 	"github.com/hashicorp/terraform/internal/backend/backendrun"
+	"github.com/hashicorp/terraform/internal/cloud"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -154,6 +155,23 @@ func (b *Remote) opApply(stopCtx, cancelCtx context.Context, op *backendrun.Oper
 				fmt.Sprintf(
 					`The host %s does not support the -target option for `+
 						`remote plans.`,
+					b.hostname,
+				),
+			))
+		}
+	}
+
+	if op.PlanMinimalRefresh {
+		desiredAPIVersion, _ := version.NewVersion(cloud.MinimalRefreshMinAPIVersion)
+
+		if parseErr != nil || currentAPIVersion.LessThan(desiredAPIVersion) {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Minimal refresh is not supported",
+				fmt.Sprintf(
+					`The host %s does not support the -minimal-refresh option. `+
+						`If you use Terraform Enterprise, upgrade to a version that `+
+						`supports minimal refresh. Otherwise, run without -minimal-refresh.`,
 					b.hostname,
 				),
 			))

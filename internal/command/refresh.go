@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -39,6 +39,25 @@ func (c *RefreshCommand) Run(rawArgs []string) int {
 	// diagnostics according to the desired view
 	view := views.NewRefresh(args.ViewType, c.View)
 
+	// Log version output
+	view.Version()
+
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(fmt.Errorf("Failed to initialize config loader: %s", err))
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	// We need to collect variables early in this command to ensure that the
+	// values are available when preparing the backend. A PSS backend will need
+	// the values to resolve the provider requirements.
+	var varDiags tfdiags.Diagnostics
+	c.Meta.VariableValues, varDiags = args.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	diags = diags.Append(varDiags)
+
 	if diags.HasErrors() {
 		view.Diagnostics(diags)
 		view.HelpPrompt()
@@ -46,7 +65,6 @@ func (c *RefreshCommand) Run(rawArgs []string) int {
 	}
 
 	// Check for user-supplied plugin path
-	var err error
 	if c.pluginPath, err = c.loadPluginPath(); err != nil {
 		diags = diags.Append(err)
 		view.Diagnostics(diags)
@@ -82,17 +100,17 @@ func (c *RefreshCommand) Run(rawArgs []string) int {
 		return 1
 	}
 
-	// Collect variable value and add them to the operation request
-	diags = diags.Append(c.GatherVariables(opReq, args.Vars))
-	if diags.HasErrors() {
-		view.Diagnostics(diags)
-		return 1
-	}
+	// Assign config loader and variables to the operation request
+	opReq.ConfigLoader = loader
+	opReq.Variables = c.Meta.VariableValues
 
 	// Before we delegate to the backend, we'll print any warning diagnostics
 	// we've accumulated here, since the backend will start fresh with its own
 	// diagnostics.
 	view.Diagnostics(diags)
+	if diags.HasErrors() {
+		return 1
+	}
 	diags = nil
 
 	// Perform the operation
@@ -117,25 +135,20 @@ func (c *RefreshCommand) PrepareBackend(args *arguments.State, viewType argument
 	// difficult but would make their use easier to understand.
 	c.Meta.applyStateArguments(args)
 
-	backendConfig, diags := c.loadBackendConfig(".")
-	if diags.HasErrors() {
-		return nil, diags
-	}
-
 	// Load the backend
-	be, beDiags := c.Backend(&BackendOpts{
-		Config:   backendConfig,
-		ViewType: viewType,
-	})
-	diags = diags.Append(beDiags)
-	if beDiags.HasErrors() {
+	be, diags := c.backend(".", viewType)
+	if diags.HasErrors() {
 		return nil, diags
 	}
 
 	return be, diags
 }
 
-func (c *RefreshCommand) OperationRequest(be backendrun.OperationsBackend, view views.Refresh, viewType arguments.ViewType, args *arguments.Operation,
+func (c *RefreshCommand) OperationRequest(
+	be backendrun.OperationsBackend,
+	view views.Refresh,
+	viewType arguments.ViewType,
+	args *arguments.Operation,
 ) (*backendrun.Operation, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
@@ -161,36 +174,7 @@ func (c *RefreshCommand) OperationRequest(be backendrun.OperationsBackend, view 
 		return nil, diags
 	}
 
-	var err error
-	opReq.ConfigLoader, err = c.initConfigLoader()
-	if err != nil {
-		diags = diags.Append(fmt.Errorf("Failed to initialize config loader: %s", err))
-		return nil, diags
-	}
-
 	return opReq, diags
-}
-
-func (c *RefreshCommand) GatherVariables(opReq *backendrun.Operation, args *arguments.Vars) tfdiags.Diagnostics {
-	var diags tfdiags.Diagnostics
-
-	// FIXME the arguments package currently trivially gathers variable related
-	// arguments in a heterogenous slice, in order to minimize the number of
-	// code paths gathering variables during the transition to this structure.
-	// Once all commands that gather variables have been converted to this
-	// structure, we could move the variable gathering code to the arguments
-	// package directly, removing this shim layer.
-
-	varArgs := args.All()
-	items := make([]arguments.FlagNameValue, len(varArgs))
-	for i := range varArgs {
-		items[i].Name = varArgs[i].Name
-		items[i].Value = varArgs[i].Value
-	}
-	c.Meta.variableArgs = arguments.FlagNameValueSlice{Items: &items}
-	opReq.Variables, diags = c.collectVariableValues()
-
-	return diags
 }
 
 func (c *RefreshCommand) Help() string {

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -13,11 +13,15 @@ import (
 	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
+	"github.com/hashicorp/terraform/internal/deprecation"
+	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/moduletest/mocking"
 	"github.com/hashicorp/terraform/internal/namedvals"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/deferring"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/refactoring"
@@ -51,27 +55,41 @@ type ContextGraphWalker struct {
 	PlanTimestamp           time.Time
 	Overrides               *mocking.Overrides
 	// Forget if set to true will cause the plan to forget all resources. This is
-	// only allowd in the context of a destroy plan.
+	// only allowed in the context of a destroy plan.
 	Forget bool
+
+	Deprecations *deprecation.Deprecations
 
 	// This is an output. Do not set this, nor read it while a graph walk
 	// is in progress.
 	NonFatalDiagnostics tfdiags.Diagnostics
 
-	once                sync.Once
-	contexts            collections.Map[evalContextScope, *BuiltinEvalContext]
-	contextLock         sync.Mutex
-	providerCache       map[string]providers.Interface
-	providerFuncCache   map[string]providers.Interface
-	providerFuncResults *providers.FunctionResults
-	providerSchemas     map[string]providers.ProviderSchema
-	providerLock        sync.Mutex
-	provisionerCache    map[string]provisioners.Interface
-	provisionerSchemas  map[string]*configschema.Block
-	provisionerLock     sync.Mutex
+	ProviderLocks map[addrs.Provider]*depsfile.ProviderLock
+
+	PolicyClient policy.Client
+	PolicyGraph  *policySubgraph // Used for writing resource policy evaluation nodes
+
+	contexts           collections.Map[evalContextScope, *BuiltinEvalContext]
+	contextLock        sync.Mutex
+	providerCache      map[string]providers.Interface
+	providerFuncCache  map[string]providers.Interface
+	functionResults    *lang.FunctionResults
+	providerSchemas    map[string]providers.ProviderSchema
+	providerLock       sync.Mutex
+	provisionerCache   map[string]provisioners.Interface
+	provisionerSchemas map[string]*configschema.Block
+	provisionerLock    sync.Mutex
 }
 
 var _ GraphWalker = (*ContextGraphWalker)(nil)
+
+// scopeEvalContextExists checks if the given scope has an associated eval context
+func (w *ContextGraphWalker) scopeEvalContextExists(scope evalContextScope) bool {
+	w.contextLock.Lock()
+	defer w.contextLock.Unlock()
+
+	return w.contexts.HasKey(scope)
+}
 
 // enterScope provides an EvalContext associated with the given scope.
 func (w *ContextGraphWalker) enterScope(scope evalContextScope) EvalContext {
@@ -94,8 +112,6 @@ func (w *ContextGraphWalker) enterScope(scope evalContextScope) EvalContext {
 }
 
 func (w *ContextGraphWalker) EvalContext() EvalContext {
-	w.once.Do(w.init)
-
 	// Our evaluator shares some locks with the main context and the walker
 	// so that we can safely run multiple evaluations at once across
 	// different modules.
@@ -111,6 +127,7 @@ func (w *ContextGraphWalker) EvalContext() EvalContext {
 		NamedValues:        w.NamedValues,
 		Deferrals:          w.Deferrals,
 		PlanTimestamp:      w.PlanTimestamp,
+		FunctionResults:    w.functionResults,
 	}
 
 	ctx := &BuiltinEvalContext{
@@ -124,7 +141,7 @@ func (w *ContextGraphWalker) EvalContext() EvalContext {
 		MoveResultsValue:        w.MoveResults,
 		ProviderCache:           w.providerCache,
 		ProviderFuncCache:       w.providerFuncCache,
-		ProviderFuncResults:     w.providerFuncResults,
+		FunctionResults:         w.functionResults,
 		ProviderInputConfig:     w.Context.providerInputConfig,
 		ProviderLock:            &w.providerLock,
 		ProvisionerCache:        w.provisionerCache,
@@ -136,21 +153,17 @@ func (w *ContextGraphWalker) EvalContext() EvalContext {
 		StateValue:              w.State,
 		RefreshStateValue:       w.RefreshState,
 		PrevRunStateValue:       w.PrevRunState,
+		PolicyGraphValue:        w.PolicyGraph,
 		Evaluator:               evaluator,
 		OverrideValues:          w.Overrides,
 		forget:                  w.Forget,
+		ProviderLocksValue:      w.ProviderLocks,
+		PolicyClientValue:       w.PolicyClient,
+		PolicySemaphoreValue:    w.Context.policySemaphore(),
+		DeprecationsValue:       w.Deprecations,
 	}
 
 	return ctx
-}
-
-func (w *ContextGraphWalker) init() {
-	w.contexts = collections.NewMap[evalContextScope, *BuiltinEvalContext]()
-	w.providerCache = make(map[string]providers.Interface)
-	w.providerFuncCache = make(map[string]providers.Interface)
-	w.providerSchemas = make(map[string]providers.ProviderSchema)
-	w.provisionerCache = make(map[string]provisioners.Interface)
-	w.provisionerSchemas = make(map[string]*configschema.Block)
 }
 
 func (w *ContextGraphWalker) Execute(ctx EvalContext, n GraphNodeExecutable) tfdiags.Diagnostics {

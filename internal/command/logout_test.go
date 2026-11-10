@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/hashicorp/cli"
-
 	svchost "github.com/hashicorp/terraform-svchost"
 	svcauth "github.com/hashicorp/terraform-svchost/auth"
 	"github.com/hashicorp/terraform-svchost/disco"
@@ -16,14 +14,15 @@ import (
 )
 
 func TestLogout(t *testing.T) {
+	t.Parallel()
 	workDir := t.TempDir()
 
-	ui := cli.NewMockUi()
 	credsSrc := cliconfig.EmptyCredentialsSourceForTests(filepath.Join(workDir, "credentials.tfrc.json"))
 
+	view, done := testView(t)
 	c := &LogoutCommand{
 		Meta: Meta{
-			Ui:       ui,
+			View:     view,
 			Services: disco.NewWithCredentialsSource(credsSrc),
 		},
 	}
@@ -58,7 +57,7 @@ func TestLogout(t *testing.T) {
 
 		status := c.Run(tc.args)
 		if status != 0 {
-			t.Fatalf("unexpected error code %d\nstderr:\n%s", status, ui.ErrorWriter.String())
+			t.Fatalf("unexpected error code %d\nstderr:\n%s", status, done(t).Stderr())
 		}
 
 		creds, err := credsSrc.ForHost(host)

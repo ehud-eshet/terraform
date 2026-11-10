@@ -1,51 +1,32 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
 
 import (
-	"fmt"
-
-	"github.com/hashicorp/cli"
 	version "github.com/hashicorp/go-version"
+	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/initwd"
 )
 
-type view interface {
-	Log(message string, params ...any)
-}
+// uiModuleInstallHooks is used to log during module download and installation.
+// Currently this occurs in both the init and get commands.
 type uiModuleInstallHooks struct {
-	initwd.ModuleInstallHooksImpl
-	Ui             cli.Ui
+	initwd.ModuleInstallHookImpl
 	ShowLocalPaths bool
-	View           view
+	View           views.ModuleInstallationLogger
 }
 
-var _ initwd.ModuleInstallHooks = uiModuleInstallHooks{}
+var _ initwd.ModuleInstallHook = uiModuleInstallHooks{}
 
 func (h uiModuleInstallHooks) Download(modulePath, packageAddr string, v *version.Version) {
-	if v != nil {
-		h.log(fmt.Sprintf("Downloading %s %s for %s...", packageAddr, v, modulePath))
-	} else {
-		h.log(fmt.Sprintf("Downloading %s for %s...", packageAddr, modulePath))
-	}
+	h.View.LogModuleDownload(packageAddr, v, modulePath)
 }
 
 func (h uiModuleInstallHooks) Install(modulePath string, v *version.Version, localDir string) {
 	if h.ShowLocalPaths {
-		h.log(fmt.Sprintf("- %s in %s", modulePath, localDir))
+		h.View.LogModuleInstallationWithLocalPath(modulePath, localDir)
 	} else {
-		h.log(fmt.Sprintf("- %s", modulePath))
-	}
-}
-
-func (h uiModuleInstallHooks) log(message string) {
-	switch h.View.(type) {
-	case view:
-		// there is no unformatted option for the View interface, so we need to
-		// pass message as a parameter to avoid double escaping % characters
-		h.View.Log("%s", message)
-	default:
-		h.Ui.Info(message)
+		h.View.LogModuleInstallation(modulePath)
 	}
 }

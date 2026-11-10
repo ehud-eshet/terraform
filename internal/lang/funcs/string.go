@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package funcs
@@ -380,6 +380,14 @@ func makeRenderTemplateFunc(funcsCb func() (funcs map[string]function.Function, 
 		if diags.HasErrors() {
 			return cty.DynamicVal, diags
 		}
+		if val.IsNull() {
+			return cty.DynamicVal, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Template result is null",
+				Detail:   "The result of the template is null, which is not a valid result for a templatestring call.",
+				Subject:  expr.Range().Ptr(),
+			}
+		}
 		return val, nil
 	}
 }
@@ -431,14 +439,4 @@ func isValidTemplateStringExpr(expr hcl.Expression) bool {
 		// Nothing else is allowed.
 		return false
 	}
-}
-
-// Replace searches a given string for another given substring,
-// and replaces all occurences with a given replacement string.
-func Replace(str, substr, replace cty.Value) (cty.Value, error) {
-	return ReplaceFunc.Call([]cty.Value{str, substr, replace})
-}
-
-func StrContains(str, substr cty.Value) (cty.Value, error) {
-	return StrContainsFunc.Call([]cty.Value{str, substr})
 }

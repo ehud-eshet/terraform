@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -6,7 +6,6 @@ package command
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"github.com/apparentlymart/go-versions/versions"
 	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/terraform/internal/command/arguments"
+	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/getproviders"
 	"github.com/hashicorp/terraform/internal/httpclient"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -31,42 +31,31 @@ func (c *ProvidersMirrorCommand) Synopsis() string {
 	return "Save local copies of all required provider plugins"
 }
 
-func (c *ProvidersMirrorCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	cmdFlags := c.Meta.defaultFlagSet("providers mirror")
-
-	var optPlatforms arguments.FlagStringSlice
-	cmdFlags.Var(&optPlatforms, "platform", "target platform")
-
-	var optLockFile bool
-	cmdFlags.BoolVar(&optLockFile, "lock-file", true, "use lock file")
-
-	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
-		return 1
-	}
-
+func (c *ProvidersMirrorCommand) Run(rawArgs []string) int {
 	var diags tfdiags.Diagnostics
 
-	args = cmdFlags.Args()
-	if len(args) != 1 {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"No output directory specified",
-			"The providers mirror command requires an output directory as a command-line argument.",
-		))
-		c.showDiagnostics(diags)
+	// Parse and apply global view arguments
+	common, rawArgs := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
+
+	// Parse command-specific arguments.
+	parsedArgs, diags := arguments.ParseProvidersMirror(rawArgs)
+
+	// Prepare the view
+	view := views.NewProvidersMirror(parsedArgs.ViewType, c.View)
+
+	// Now the view is ready, process any error diagnostics from parsing arguments.
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
-	outputDir := args[0]
 
 	var platforms []getproviders.Platform
-	if len(optPlatforms) == 0 {
+	if len(parsedArgs.Platforms) == 0 {
 		platforms = []getproviders.Platform{getproviders.CurrentPlatform}
 	} else {
-		platforms = make([]getproviders.Platform, 0, len(optPlatforms))
-		for _, platformStr := range optPlatforms {
+		platforms = make([]getproviders.Platform, 0, len(parsedArgs.Platforms))
+		for _, platformStr := range parsedArgs.Platforms {
 			platform, err := getproviders.ParsePlatform(platformStr)
 			if err != nil {
 				diags = diags.Append(tfdiags.Sourceless(
@@ -84,8 +73,35 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 	ctx, done := c.InterruptibleContext(c.CommandContext())
 	defer done()
 
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(err)
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	var varDiags tfdiags.Diagnostics
+	c.VariableValues, varDiags = parsedArgs.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	diags = diags.Append(varDiags)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	diags = diags.Append(c.resolveConstVariables(".", parsedArgs.ViewType))
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
+
 	config, confDiags := c.loadConfig(".")
 	diags = diags.Append(confDiags)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
 	reqs, moreDiags := config.ProviderRequirements()
 	diags = diags.Append(moreDiags)
 
@@ -94,7 +110,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 	diags = diags.Append(lockedDepsDiags)
 
 	// If lock file is present, validate it against configuration
-	if !lockedDeps.Empty() && optLockFile {
+	if !lockedDeps.Empty() && parsedArgs.LockFile {
 		if errs := config.VerifyDependencySelections(lockedDeps); len(errs) > 0 {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
@@ -106,7 +122,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 
 	// If we have any error diagnostics already then we won't proceed further.
 	if diags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -144,13 +160,15 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 
 	for provider, constraints := range reqs {
 		if provider.IsBuiltIn() {
-			c.Ui.Output(fmt.Sprintf("- Skipping %s because it is built in to Terraform CLI", provider.ForDisplay()))
+			view.LogBuiltInProviderAvailable(provider)
 			continue
 		}
-		constraintsStr := getproviders.VersionConstraintsString(constraints)
-		c.Ui.Output(fmt.Sprintf("- Mirroring %s...", provider.ForDisplay()))
+
+		view.MirrorProviderStart(provider)
+
 		// First we'll look for the latest version that matches the given
 		// constraint, which we'll then try to mirror for each target platform.
+		constraintsStr := getproviders.VersionConstraintsString(constraints)
 		acceptable := versions.MeetingConstraints(constraints)
 		avail, _, err := source.AvailableVersions(ctx, provider)
 		candidates := avail.Filter(acceptable)
@@ -166,16 +184,16 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 			continue
 		}
 		selected := candidates.Newest()
-		if !lockedDeps.Empty() && optLockFile {
+		if !lockedDeps.Empty() && parsedArgs.LockFile {
 			selected = lockedDeps.Provider(provider).Version()
-			c.Ui.Output(fmt.Sprintf("  - Selected v%s to match dependency lock file", selected.String()))
+			view.LogReusingPreviousProviderVersion(selected)
 		} else if len(constraintsStr) > 0 {
-			c.Ui.Output(fmt.Sprintf("  - Selected v%s to meet constraints %s", selected.String(), constraintsStr))
+			view.LogFindingMatchingVersion(selected, constraints)
 		} else {
-			c.Ui.Output(fmt.Sprintf("  - Selected v%s with no constraints", selected.String()))
+			view.LogFindingLatestVersion(selected)
 		}
 		for _, platform := range platforms {
-			c.Ui.Output(fmt.Sprintf("  - Downloading package for %s...", platform.String()))
+			view.LogInstallProviderVersionStart(platform)
 			meta, err := source.PackageMeta(ctx, provider, selected, platform)
 			if err != nil {
 				diags = diags.Append(tfdiags.Sourceless(
@@ -214,7 +232,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 			// so we can verify its checksums and signatures before making
 			// it discoverable to mirror clients. (stagingPath intentionally
 			// does not follow the filesystem mirror file naming convention.)
-			targetPath := meta.PackedFilePath(outputDir)
+			targetPath := meta.PackedFilePath(parsedArgs.OutputDir)
 			stagingPath := filepath.Join(filepath.Dir(targetPath), "."+filepath.Base(targetPath))
 			err = httpGetter.GetFile(stagingPath, urlObj)
 			if err != nil {
@@ -235,7 +253,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 					))
 					continue
 				}
-				c.Ui.Output(fmt.Sprintf("  - Package authenticated: %s", result))
+				view.LogInstallProviderVersionComplete(result)
 			}
 			os.Remove(targetPath) // okay if it fails because we're going to try to rename over it next anyway
 			err = os.Rename(stagingPath, targetPath)
@@ -255,7 +273,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 	// by relying on the selections we made above, because we want to still
 	// include in the indices any packages that were already present and
 	// not affected by the changes we just made.
-	available, err := getproviders.SearchLocalDirectory(outputDir)
+	available, err := getproviders.SearchLocalDirectory(parsedArgs.OutputDir)
 	if err != nil {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
@@ -273,7 +291,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 		// we'll ask the getproviders package to build an archive filename
 		// for a fictitious package and then use the directory portion of it.
 		indexDir := filepath.Dir(getproviders.PackedFilePathForPackage(
-			outputDir, provider, versions.Unspecified, getproviders.CurrentPlatform,
+			parsedArgs.OutputDir, provider, versions.Unspecified, getproviders.CurrentPlatform,
 		))
 		indexVersions := map[string]interface{}{}
 		indexArchives := map[getproviders.Version]map[string]interface{}{}
@@ -321,7 +339,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 		// when running on Windows as of Go 1.13. We should revisit this once
 		// we're supporting network mirrors, to avoid having them briefly
 		// become corrupted during updates.
-		err = ioutil.WriteFile(filepath.Join(indexDir, "index.json"), mainIndexJSON, 0644)
+		err = os.WriteFile(filepath.Join(indexDir, "index.json"), mainIndexJSON, 0644)
 		if err != nil {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
@@ -339,7 +357,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 				// our control.
 				panic(fmt.Sprintf("failed to encode version index: %s", err))
 			}
-			err = ioutil.WriteFile(filepath.Join(indexDir, version.String()+".json"), versionIndexJSON, 0644)
+			err = os.WriteFile(filepath.Join(indexDir, version.String()+".json"), versionIndexJSON, 0644)
 			if err != nil {
 				diags = diags.Append(tfdiags.Sourceless(
 					tfdiags.Error,
@@ -350,7 +368,7 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 		}
 	}
 
-	c.showDiagnostics(diags)
+	view.Diagnostics(diags)
 	if diags.HasErrors() {
 		return 1
 	}
@@ -373,21 +391,30 @@ Usage: terraform [global options] providers mirror [options] <target-dir>
 
 Options:
 
-  -platform=os_arch  Choose which target platform to build a mirror for.
-                     By default Terraform will obtain plugin packages
-                     suitable for the platform where you run this command.
-                     Use this flag multiple times to include packages for
-                     multiple target systems.
+  -platform=os_arch   Choose which target platform to build a mirror for.
+                      By default Terraform will obtain plugin packages
+                      suitable for the platform where you run this command.
+                      Use this flag multiple times to include packages for
+                      multiple target systems.
 
-                     Target names consist of an operating system and a CPU
-                     architecture. For example, "linux_amd64" selects the
-                     Linux operating system running on an AMD64 or x86_64
-                     CPU. Each provider is available only for a limited
-                     set of target platforms.
+                      Target names consist of an operating system and a CPU
+                      architecture. For example, "linux_amd64" selects the
+                      Linux operating system running on an AMD64 or x86_64
+                      CPU. Each provider is available only for a limited
+                      set of target platforms.
 
-  -lock-file=false  Ignore the provider lock file when fetching providers.
-                    By default the mirror command will use the version info
-                    in the lock file if the configuration directory has been
-                    previously initialized.
+  -lock-file=false    Ignore the provider lock file when fetching providers.
+                      By default the mirror command will use the version info
+                      in the lock file if the configuration directory has been
+                      previously initialized.
+
+  -var 'foo=bar'      Set a value for one of the input variables in the root
+                      module of the configuration. Use this option more than
+                      once to set more than one variable.
+
+  -var-file=filename  Load variable values from the given file, in addition
+                      to the default files terraform.tfvars and *.auto.tfvars.
+                      Use this option more than once to include more than one
+                      variables file.
 `
 }

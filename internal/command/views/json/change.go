@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package json
@@ -59,6 +59,50 @@ func (c *ResourceInstanceChange) String() string {
 	return fmt.Sprintf("%s: Plan to %s", c.Resource.Addr, c.Action)
 }
 
+func NewPlannedActionInvocation(aiSrc *plans.ActionInvocationInstanceSrc) *ActionInvocation {
+	ai := &ActionInvocation{
+		Action: newActionAddr(aiSrc.Addr),
+	}
+
+	switch trigger := aiSrc.ActionTrigger.(type) {
+	case *plans.ResourceActionTrigger:
+		ai.LifecycleTrigger = &ActionInvocationLifecycleTrigger{
+			TriggeringResource:      newResourceAddr(trigger.TriggeringResourceAddr),
+			TriggeringEvent:         trigger.ActionTriggerEvent.String(),
+			ActionTriggerBlockIndex: trigger.ActionTriggerBlockIndex,
+			ActionsListIndex:        trigger.ActionsListIndex,
+			OnFailure:               trigger.ActionOnFailure.String(),
+		}
+	case *plans.InvokeActionTrigger:
+		ai.InvokeTrigger = new(ActionInvocationInvokeTrigger)
+	}
+
+	return ai
+}
+
+type ActionInvocation struct {
+	Action           ActionAddr                        `json:"action_addr"`
+	LifecycleTrigger *ActionInvocationLifecycleTrigger `json:"lifecycle_trigger,omitempty"`
+	InvokeTrigger    *ActionInvocationInvokeTrigger    `json:"action_trigger,omitempty"`
+}
+
+func (c *ActionInvocation) String() string {
+	if c.LifecycleTrigger != nil {
+		return fmt.Sprintf("%s: triggered by %s trigger on %s", c.Action.Addr, c.LifecycleTrigger.TriggeringEvent, c.LifecycleTrigger.TriggeringResource.Addr)
+	}
+	return c.Action.Addr
+}
+
+type ActionInvocationLifecycleTrigger struct {
+	TriggeringResource      ResourceAddr `json:"triggering_resource"`
+	TriggeringEvent         string       `json:"triggering_event"`
+	ActionTriggerBlockIndex int          `json:"action_trigger_block_index"`
+	ActionsListIndex        int          `json:"actions_list_index"`
+	OnFailure               string       `json:"on_failure"`
+}
+
+type ActionInvocationInvokeTrigger struct{}
+
 type ChangeAction string
 
 const (
@@ -90,7 +134,7 @@ func changeAction(action plans.Action) ChangeAction {
 		return ActionRead
 	case plans.Update:
 		return ActionUpdate
-	case plans.DeleteThenCreate, plans.CreateThenDelete, plans.CreateThenForget:
+	case plans.DeleteThenCreate, plans.CreateThenDelete, plans.ForgetThenCreate, plans.CreateThenForget:
 		return ActionReplace
 	case plans.Delete:
 		return ActionDelete

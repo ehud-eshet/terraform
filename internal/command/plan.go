@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform/internal/backend/backendrun"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/views"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -32,10 +33,30 @@ func (c *PlanCommand) Run(rawArgs []string) int {
 
 	// Parse and validate flags
 	args, diags := arguments.ParsePlan(rawArgs)
+	diags = diags.Append(c.Validate(args))
 
 	// Instantiate the view, even if there are flag errors, so that we render
 	// diagnostics according to the desired view
 	view := views.NewPlan(args.ViewType, c.View)
+
+	// Log version output
+	view.Version()
+
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(fmt.Errorf("Failed to initialize config loader: %s", err))
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	// We need to collect variables early in this command to ensure that the
+	// values are available when preparing the backend. A PSS backend will need
+	// the values to resolve the provider requirements.
+	var varDiags tfdiags.Diagnostics
+	c.Meta.VariableValues, varDiags = args.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	diags = diags.Append(varDiags)
 
 	if diags.HasErrors() {
 		view.Diagnostics(diags)
@@ -44,7 +65,6 @@ func (c *PlanCommand) Run(rawArgs []string) int {
 	}
 
 	// Check for user-supplied plugin path
-	var err error
 	if c.pluginPath, err = c.loadPluginPath(); err != nil {
 		diags = diags.Append(err)
 		view.Diagnostics(diags)
@@ -79,24 +99,36 @@ func (c *PlanCommand) Run(rawArgs []string) int {
 	}
 
 	// Build the operation request
-	opReq, opDiags := c.OperationRequest(be, view, args.ViewType, args.Operation, args.OutPath, args.GenerateConfigPath)
+	opReq, opDiags := c.OperationRequest(be, view, args.ViewType, args.Operation, args.OutPath, args.GenerateConfigPath, args.PolicyPaths)
 	diags = diags.Append(opDiags)
 	if diags.HasErrors() {
 		view.Diagnostics(diags)
 		return 1
 	}
 
-	// Collect variable value and add them to the operation request
-	diags = diags.Append(c.GatherVariables(opReq, args.Vars))
-	if diags.HasErrors() {
-		view.Diagnostics(diags)
-		return 1
+	if len(args.PolicyPaths) > 0 {
+		client, policyDiags, stopClient := c.PolicyClient(c.CommandContext(), args.PolicyPaths, backendPolicyEntitlement(be, policy.PlanEvaluationStage))
+		// if there has been any errors when setting up the policy client, we log them but
+		// we still proceed with the operation, as a failure to set up the policy client
+		// should not prevent the plan operation from running
+		if opReq.View != nil && policyDiags != nil {
+			opReq.View.PolicyDiagnostics(policyDiags)
+		}
+		opReq.PolicyClient = client
+		defer stopClient()
 	}
+
+	// Assign config loader and variables to the operation request
+	opReq.ConfigLoader = loader
+	opReq.Variables = c.Meta.VariableValues
 
 	// Before we delegate to the backend, we'll print any warning diagnostics
 	// we've accumulated here, since the backend will start fresh with its own
 	// diagnostics.
 	view.Diagnostics(diags)
+	if diags.HasErrors() {
+		return 1
+	}
 	diags = nil
 
 	// Perform the operation
@@ -117,6 +149,10 @@ func (c *PlanCommand) Run(rawArgs []string) int {
 	return op.Result.ExitStatus()
 }
 
+func (c *PlanCommand) Validate(args *arguments.Plan) (diags tfdiags.Diagnostics) {
+	return diags.Append(validatePolicyPaths(args.PolicyPaths))
+}
+
 func (c *PlanCommand) PrepareBackend(args *arguments.State, viewType arguments.ViewType) (backendrun.OperationsBackend, tfdiags.Diagnostics) {
 	// FIXME: we need to apply the state arguments to the meta object here
 	// because they are later used when initializing the backend. Carving a
@@ -124,18 +160,9 @@ func (c *PlanCommand) PrepareBackend(args *arguments.State, viewType arguments.V
 	// difficult but would make their use easier to understand.
 	c.Meta.applyStateArguments(args)
 
-	backendConfig, diags := c.loadBackendConfig(".")
-	if diags.HasErrors() {
-		return nil, diags
-	}
-
 	// Load the backend
-	be, beDiags := c.Backend(&BackendOpts{
-		Config:   backendConfig,
-		ViewType: viewType,
-	})
-	diags = diags.Append(beDiags)
-	if beDiags.HasErrors() {
+	be, diags := c.backend(".", viewType)
+	if diags.HasErrors() {
 		return nil, diags
 	}
 
@@ -149,6 +176,7 @@ func (c *PlanCommand) OperationRequest(
 	args *arguments.Operation,
 	planOutPath string,
 	generateConfigOut string,
+	policyPaths []string,
 ) (*backendrun.Operation, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
@@ -164,6 +192,8 @@ func (c *PlanCommand) OperationRequest(
 	opReq.ForceReplace = args.ForceReplace
 	opReq.Type = backendrun.OperationTypePlan
 	opReq.View = view.Operation()
+	opReq.ActionTargets = args.ActionTargets
+	opReq.PlanMinimalRefresh = args.MinimalRefresh
 
 	// EXPERIMENTAL: maybe enable deferred actions
 	if c.AllowExperimentalFeatures {
@@ -179,36 +209,7 @@ func (c *PlanCommand) OperationRequest(
 		return nil, diags
 	}
 
-	var err error
-	opReq.ConfigLoader, err = c.initConfigLoader()
-	if err != nil {
-		diags = diags.Append(fmt.Errorf("Failed to initialize config loader: %s", err))
-		return nil, diags
-	}
-
 	return opReq, diags
-}
-
-func (c *PlanCommand) GatherVariables(opReq *backendrun.Operation, args *arguments.Vars) tfdiags.Diagnostics {
-	var diags tfdiags.Diagnostics
-
-	// FIXME the arguments package currently trivially gathers variable related
-	// arguments in a heterogenous slice, in order to minimize the number of
-	// code paths gathering variables during the transition to this structure.
-	// Once all commands that gather variables have been converted to this
-	// structure, we could move the variable gathering code to the arguments
-	// package directly, removing this shim layer.
-
-	varArgs := args.All()
-	items := make([]arguments.FlagNameValue, len(varArgs))
-	for i := range varArgs {
-		items[i].Name = varArgs[i].Name
-		items[i].Value = varArgs[i].Value
-	}
-	c.Meta.variableArgs = arguments.FlagNameValueSlice{Items: &items}
-	opReq.Variables, diags = c.collectVariableValues()
-
-	return diags
 }
 
 func (c *PlanCommand) Help() string {
@@ -236,6 +237,13 @@ Plan Customization Options:
                       whether remote objects still match the outcome of the
                       most recent Terraform apply but does not propose any
                       actions to undo any changes made outside of Terraform.
+
+  -minimal-refresh    Skips checking for external changes to objects managed by
+                      this configuration when an initial plan indicates that the
+                      object has not changed since the most recent Terraform apply.
+                      This can potentially make planning faster, but at the expense
+                      of possibly planning against a stale record of the remote
+                      system state.
 
   -refresh=false      Skip checking for external changes to remote objects
                       while creating the plan. This can potentially make

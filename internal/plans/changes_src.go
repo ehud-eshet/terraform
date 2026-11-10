@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package plans
@@ -9,6 +9,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/genconfig"
 	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/schemarepo"
@@ -23,6 +24,12 @@ import (
 type ChangesSrc struct {
 	// Resources tracks planned changes to resource instance objects.
 	Resources []*ResourceInstanceChangeSrc
+
+	Queries []*QueryInstanceSrc
+
+	// ActionInvocations tracks planned action invocations, which may have
+	// embedded resource instance changes.
+	ActionInvocations []*ActionInvocationInstanceSrc
 
 	// Outputs tracks planned changes output values.
 	//
@@ -54,6 +61,11 @@ func (c *ChangesSrc) Empty() bool {
 		if out.Addr.Module.IsRoot() && out.Action != NoOp {
 			return false
 		}
+	}
+
+	if len(c.ActionInvocations) > 0 {
+		// action invocations can be applied
+		return false
 	}
 
 	return true
@@ -122,7 +134,7 @@ func (c *ChangesSrc) Decode(schemas *schemarepo.Schemas) (*Changes, error) {
 			return nil, fmt.Errorf("ChangesSrc.Decode: missing schema for %s", rcs.Addr)
 		}
 
-		rc, err := rcs.Decode(schema.Body.ImpliedType())
+		rc, err := rcs.Decode(schema)
 		if err != nil {
 			return nil, err
 		}
@@ -131,6 +143,43 @@ func (c *ChangesSrc) Decode(schemas *schemarepo.Schemas) (*Changes, error) {
 		rc.After = marks.MarkPaths(rc.After, marks.Sensitive, rcs.AfterSensitivePaths)
 
 		changes.Resources = append(changes.Resources, rc)
+	}
+
+	for _, qis := range c.Queries {
+		p, ok := schemas.Providers[qis.ProviderAddr.Provider]
+		if !ok {
+			return nil, fmt.Errorf("ChangesSrc.Decode: missing provider %s for %s", qis.ProviderAddr, qis.Addr)
+		}
+		schema := p.ListResourceTypes[qis.Addr.Resource.Resource.Type]
+
+		if schema.Body == nil {
+			return nil, fmt.Errorf("ChangesSrc.Decode: missing schema for %s", qis.Addr)
+		}
+
+		query, err := qis.Decode(schema)
+		if err != nil {
+			return nil, err
+		}
+
+		changes.Queries = append(changes.Queries, query)
+	}
+
+	for _, ais := range c.ActionInvocations {
+		p, ok := schemas.Providers[ais.ProviderAddr.Provider]
+		if !ok {
+			return nil, fmt.Errorf("ChangesSrc.Decode: missing provider %s for %s", ais.ProviderAddr, ais.Addr)
+		}
+		schema, ok := p.Actions[ais.Addr.Action.Action.Type]
+		if !ok {
+			return nil, fmt.Errorf("ChangesSrc.Decode: missing schema for %s", ais.Addr.Action.Action.Type)
+		}
+
+		action, err := ais.Decode(&schema)
+		if err != nil {
+			return nil, err
+		}
+
+		changes.ActionInvocations = append(changes.ActionInvocations, action)
 	}
 
 	for _, ocs := range c.Outputs {
@@ -152,6 +201,29 @@ func (c *ChangesSrc) AppendResourceInstanceChange(change *ResourceInstanceChange
 
 	s := change.DeepCopy()
 	c.Resources = append(c.Resources, s)
+}
+
+type QueryInstanceSrc struct {
+	Addr         addrs.AbsResourceInstance
+	ProviderAddr addrs.AbsProviderConfig
+	Results      DynamicValue
+	Generated    genconfig.ImportGroup
+}
+
+func (qis *QueryInstanceSrc) Decode(schema providers.Schema) (*QueryInstance, error) {
+	query, err := qis.Results.Decode(schema.Body.ImpliedType())
+	if err != nil {
+		return nil, err
+	}
+
+	return &QueryInstance{
+		Addr: qis.Addr,
+		Results: QueryResults{
+			Value:     query,
+			Generated: qis.Generated,
+		},
+		ProviderAddr: qis.ProviderAddr,
+	}, nil
 }
 
 // ResourceInstanceChangeSrc is a not-yet-decoded ResourceInstanceChange.
@@ -232,8 +304,8 @@ func (rcs *ResourceInstanceChangeSrc) ObjectAddr() addrs.AbsResourceInstanceObje
 // Decode unmarshals the raw representation of the instance object being
 // changed. Pass the implied type of the corresponding resource type schema
 // for correct operation.
-func (rcs *ResourceInstanceChangeSrc) Decode(ty cty.Type) (*ResourceInstanceChange, error) {
-	change, err := rcs.ChangeSrc.Decode(ty)
+func (rcs *ResourceInstanceChangeSrc) Decode(schema providers.Schema) (*ResourceInstanceChange, error) {
+	change, err := rcs.ChangeSrc.Decode(&schema)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +381,7 @@ type OutputChangeSrc struct {
 // Decode unmarshals the raw representation of the output value being
 // changed.
 func (ocs *OutputChangeSrc) Decode() (*OutputChange, error) {
-	change, err := ocs.ChangeSrc.Decode(cty.DynamicPseudoType)
+	change, err := ocs.ChangeSrc.Decode(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -349,6 +421,9 @@ type ImportingSrc struct {
 	// ID is the original ID of the imported resource.
 	ID string
 
+	// Identity is the original identity of the imported resource.
+	Identity DynamicValue
+
 	// Unknown is true if the ID was unknown when we tried to import it. This
 	// should only be true if the overall change is embedded within a deferred
 	// action.
@@ -356,18 +431,36 @@ type ImportingSrc struct {
 }
 
 // Decode unmarshals the raw representation of the importing action.
-func (is *ImportingSrc) Decode() *Importing {
+func (is *ImportingSrc) Decode(identityType cty.Type) *Importing {
 	if is == nil {
 		return nil
 	}
 	if is.Unknown {
+		if is.Identity == nil {
+			return &Importing{
+				Target: cty.UnknownVal(cty.String),
+			}
+		}
+
 		return &Importing{
-			ID: cty.UnknownVal(cty.String),
+			Target: cty.UnknownVal(cty.EmptyObject),
 		}
 	}
-	return &Importing{
-		ID: cty.StringVal(is.ID),
+
+	if is.Identity == nil {
+		return &Importing{
+			Target: cty.StringVal(is.ID),
+		}
 	}
+
+	target, err := is.Identity.Decode(identityType)
+	if err != nil {
+		return &Importing{
+			Target: target,
+		}
+	}
+
+	return nil
 }
 
 // ChangeSrc is a not-yet-decoded Change.
@@ -379,6 +472,11 @@ type ChangeSrc struct {
 	// but have not yet been decoded from the serialized value used for
 	// storage.
 	Before, After DynamicValue
+
+	// BeforeIdentity and AfterIdentity correspond to the fields of the same name in Change,
+	// but have not yet been decoded from the serialized value used for
+	// storage.
+	BeforeIdentity, AfterIdentity DynamicValue
 
 	// BeforeSensitivePaths and AfterSensitivePaths are the paths for any
 	// values in Before or After (respectively) that are considered to be
@@ -409,15 +507,31 @@ type ChangeSrc struct {
 // Where a ChangeSrc is embedded in some other struct, it's generally better
 // to call the corresponding Decode method of that struct rather than working
 // directly with its embedded Change.
-func (cs *ChangeSrc) Decode(ty cty.Type) (*Change, error) {
+func (cs *ChangeSrc) Decode(schema *providers.Schema) (*Change, error) {
 	var err error
+
+	ty := cty.DynamicPseudoType
+	identityType := cty.DynamicPseudoType
+	if schema != nil {
+		ty = schema.Body.ImpliedType()
+		identityType = schema.Identity.ImpliedType()
+	}
+
 	before := cty.NullVal(ty)
+	beforeIdentity := cty.NullVal(identityType)
 	after := cty.NullVal(ty)
+	afterIdentity := cty.NullVal(identityType)
 
 	if len(cs.Before) > 0 {
 		before, err = cs.Before.Decode(ty)
 		if err != nil {
 			return nil, fmt.Errorf("error decoding 'before' value: %s", err)
+		}
+	}
+	if len(cs.BeforeIdentity) > 0 {
+		beforeIdentity, err = cs.BeforeIdentity.Decode(identityType)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding 'beforeIdentity' value: %s", err)
 		}
 	}
 	if len(cs.After) > 0 {
@@ -426,12 +540,79 @@ func (cs *ChangeSrc) Decode(ty cty.Type) (*Change, error) {
 			return nil, fmt.Errorf("error decoding 'after' value: %s", err)
 		}
 	}
+	if len(cs.AfterIdentity) > 0 {
+		afterIdentity, err = cs.AfterIdentity.Decode(identityType)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding 'afterIdentity' value: %s", err)
+		}
+	}
 
 	return &Change{
 		Action:          cs.Action,
 		Before:          marks.MarkPaths(before, marks.Sensitive, cs.BeforeSensitivePaths),
+		BeforeIdentity:  beforeIdentity,
 		After:           marks.MarkPaths(after, marks.Sensitive, cs.AfterSensitivePaths),
-		Importing:       cs.Importing.Decode(),
+		AfterIdentity:   afterIdentity,
+		Importing:       cs.Importing.Decode(identityType),
 		GeneratedConfig: cs.GeneratedConfig,
 	}, nil
+}
+
+// AppendActionInvocationInstanceChange records the given resource instance change in
+// the set of planned resource changes.
+func (c *ChangesSrc) AppendActionInvocationInstanceChange(action *ActionInvocationInstanceSrc) {
+	if c == nil {
+		panic("AppendActionInvocationInstanceChange on nil ChangesSync")
+	}
+
+	a := action.DeepCopy()
+	c.ActionInvocations = append(c.ActionInvocations, a)
+}
+
+type ActionInvocationInstanceSrc struct {
+	Addr          addrs.AbsActionInstance
+	ActionTrigger ActionTrigger
+
+	ConfigValue          DynamicValue
+	SensitiveConfigPaths []cty.Path
+
+	ProviderAddr addrs.AbsProviderConfig
+}
+
+// Decode unmarshals the raw representation of actions.
+func (acs *ActionInvocationInstanceSrc) Decode(schema *providers.ActionSchema) (*ActionInvocationInstance, error) {
+	ty := cty.DynamicPseudoType
+	if schema != nil {
+		ty = schema.ConfigSchema.ImpliedType()
+	}
+
+	config, err := acs.ConfigValue.Decode(ty)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding 'config' value: %s", err)
+	}
+	markedConfigValue := marks.MarkPaths(config, marks.Sensitive, acs.SensitiveConfigPaths)
+
+	ai := &ActionInvocationInstance{
+		Addr:          acs.Addr,
+		ActionTrigger: acs.ActionTrigger,
+		ProviderAddr:  acs.ProviderAddr,
+		ConfigValue:   markedConfigValue,
+	}
+	return ai, nil
+}
+
+func (acs *ActionInvocationInstanceSrc) DeepCopy() *ActionInvocationInstanceSrc {
+	if acs == nil {
+		return acs
+	}
+	ret := *acs
+	ret.ConfigValue = ret.ConfigValue.Copy()
+	return &ret
+}
+
+func (acs *ActionInvocationInstanceSrc) Less(other *ActionInvocationInstanceSrc) bool {
+	if acs.ActionTrigger.Equals(other.ActionTrigger) {
+		return acs.Addr.Less(other.Addr)
+	}
+	return acs.ActionTrigger.Less(other.ActionTrigger)
 }

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package getproviders
@@ -6,13 +6,18 @@ package getproviders
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/apparentlymart/go-versions/versions"
 	"github.com/google/go-cmp/cmp"
 	svchost "github.com/hashicorp/terraform-svchost"
+	"github.com/hashicorp/terraform-svchost/disco"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 )
@@ -32,6 +37,11 @@ func TestSourceAvailableVersions(t *testing.T) {
 			"example.com/awesomesauce/happycloud",
 			[]string{"0.1.0", "1.0.0", "1.2.0", "2.0.0"},
 			``,
+		},
+		{
+			"example.com/awesomesauce/invalidsemver",
+			[]string{"0.1.0", "1.0.0"},
+			``, // No error expected as invalid semvers are just logged and skipped
 		},
 		{
 			"example.com/weaksauce/no-versions",
@@ -239,4 +249,42 @@ func TestSourcePackageMeta(t *testing.T) {
 		})
 	}
 
+}
+
+// TestRegistrySourceReusesHTTPConnection checks that a RegistrySource makes its
+// requests to one host over a single connection, rather than opening a new one
+// (and repeating the TLS handshake) for every request.
+func TestRegistrySourceReusesHTTPConnection(t *testing.T) {
+	var mu sync.Mutex
+	newConns := 0
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(fakeRegistryHandler))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			mu.Lock()
+			newConns++
+			mu.Unlock()
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	services := disco.New()
+	services.ForceHostServices(svchost.Hostname("example.com"), map[string]interface{}{
+		"providers.v1": server.URL + "/providers/v1/",
+	})
+	source := NewRegistrySource(services)
+
+	for _, name := range []string{"example.com/awesomesauce/happycloud", "example.com/weaksauce/protocol-six"} {
+		provider := addrs.MustParseProviderSourceString(name)
+		if _, _, err := source.AvailableVersions(context.Background(), provider); err != nil {
+			t.Fatalf("AvailableVersions for %s: %s", provider, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if newConns != 1 {
+		t.Errorf("opened %d connections for 2 requests; want 1", newConns)
+	}
 }

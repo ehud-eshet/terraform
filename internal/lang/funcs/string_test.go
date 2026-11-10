@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package funcs
@@ -64,7 +64,7 @@ func TestReplace(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("replace(%#v, %#v, %#v)", test.String, test.Substr, test.Replace), func(t *testing.T) {
-			got, err := Replace(test.String, test.Substr, test.Replace)
+			got, err := ReplaceFunc.Call([]cty.Value{test.String, test.Substr, test.Replace})
 
 			if test.Err {
 				if err == nil {
@@ -123,7 +123,7 @@ func TestStrContains(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("includes(%#v, %#v)", test.String, test.Substr), func(t *testing.T) {
-			got, err := StrContains(test.String, test.Substr)
+			got, err := StrContainsFunc.Call([]cty.Value{test.String, test.Substr})
 
 			if test.Err {
 				if err == nil {
@@ -273,6 +273,28 @@ func TestTemplateString(t *testing.T) {
 		want         cty.Value
 		wantErr      string
 	}{
+		{ // a single string interpolation that evaluates to null should fail
+			`template`,
+			map[string]cty.Value{
+				"template": cty.StringVal(`${test}`),
+			},
+			cty.ObjectVal(map[string]cty.Value{
+				"test": cty.NullVal(cty.String),
+			}),
+			cty.NilVal,
+			`<templatestring argument>:1,1-8: Template result is null; The result of the template is null, which is not a valid result for a templatestring call.`,
+		},
+		{ // a single string interpolation that evaluates to unknown should not fail
+			`template`,
+			map[string]cty.Value{
+				"template": cty.StringVal(`${test}`),
+			},
+			cty.ObjectVal(map[string]cty.Value{
+				"test": cty.UnknownVal(cty.String),
+			}),
+			cty.UnknownVal(cty.String).RefineNotNull(),
+			``,
+		},
 		{
 			`template`,
 			map[string]cty.Value{
@@ -314,7 +336,7 @@ func TestTemplateString(t *testing.T) {
 			// from somewhere else and want to avoid callers needing to deal
 			// with anything other than string results.
 			cty.NilVal,
-			`invalid template result: string required`,
+			`invalid template result: string required, but have tuple`,
 		},
 		{
 			`data.whatever.whatever["foo"].result`,

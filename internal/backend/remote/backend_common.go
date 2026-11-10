@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package remote
@@ -45,6 +45,33 @@ func backoff(min, max float64, iter int) time.Duration {
 		backoff = max
 	}
 	return time.Duration(backoff) * time.Millisecond
+}
+
+func (b *Remote) waitForPostPlanTasks(stopCtx, cancelCtx context.Context, r *tfe.Run) error {
+	taskStages := make(taskStages)
+	result, err := b.client.Runs.ReadWithOptions(stopCtx, r.ID, &tfe.RunReadOptions{
+		Include: []tfe.RunIncludeOpt{tfe.RunTaskStages},
+	})
+	if err == nil {
+		for _, t := range result.TaskStages {
+			if t != nil {
+				taskStages[t.Stage] = t
+			}
+		}
+	} else {
+		// This error would be expected for older versions of TFE that do not allow
+		// fetching task_stages.
+		if !strings.HasSuffix(err.Error(), "Invalid include parameter") {
+			generalError("Failed to retrieve run", err)
+		}
+	}
+
+	if stage, ok := taskStages[tfe.PostPlan]; ok {
+		if err := b.waitTaskStage(stopCtx, cancelCtx, r, stage.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Remote) waitForRun(stopCtx, cancelCtx context.Context, op *backendrun.Operation, opType string, r *tfe.Run, w *tfe.Workspace) (*tfe.Run, error) {
@@ -222,11 +249,8 @@ func (b *Remote) waitForRun(stopCtx, cancelCtx context.Context, op *backendrun.O
 // remote system's responsibility to do final validation of the input.
 func (b *Remote) hasExplicitVariableValues(op *backendrun.Operation) bool {
 	// Load the configuration using the caller-provided configuration loader.
-	config, _, configDiags := op.ConfigLoader.LoadConfigWithSnapshot(op.ConfigDir)
+	config, configDiags := op.ConfigLoader.LoadRootModule(op.ConfigDir)
 	if configDiags.HasErrors() {
-		// If we can't load the configuration then we'll assume no explicit
-		// variable values just to let the remote operation start and let
-		// the remote system return the same set of configuration errors.
 		return false
 	}
 
@@ -235,7 +259,7 @@ func (b *Remote) hasExplicitVariableValues(op *backendrun.Operation) bool {
 	// goal here is just to make a best effort count of how many variable
 	// values are coming from -var or -var-file CLI arguments so that we can
 	// hint the user that those are not supported for remote operations.
-	variables, _ := backendrun.ParseVariableValues(op.Variables, config.Module.Variables)
+	variables, _ := backendrun.ParseVariableValues(op.Variables, config.Variables)
 
 	// Check for explicitly-defined (-var and -var-file) variables, which the
 	// remote backend does not support. All other source types are okay,

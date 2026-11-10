@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform/internal/dag"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/states"
+	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
 func TestDestroyEdgeTransformer_basic(t *testing.T) {
@@ -400,7 +401,7 @@ func TestPruneUnusedNodesTransformer_rootModuleOutputValues(t *testing.T) {
 		},
 	}
 	graph, diags := builder.Build(addrs.RootModuleInstance)
-	assertNoDiagnostics(t, diags)
+	tfdiags.AssertNoDiagnostics(t, diags)
 
 	// At this point, thanks to pruneUnusedNodesTransformer, we should still
 	// have the node for the output value, but the "test.a (expand)" node
@@ -409,8 +410,8 @@ func TestPruneUnusedNodesTransformer_rootModuleOutputValues(t *testing.T) {
 
 	nodesByName := make(map[string]dag.Vertex)
 	nodesByResourceExpand := make(map[string]dag.Vertex)
-	for _, n := range graph.Vertices() {
-		name := dag.VertexName(n)
+	for n := range graph.VerticesSeq() {
+		name := n.Name()
 		if _, exists := nodesByName[name]; exists {
 			t.Fatalf("multiple nodes have name %q", name)
 		}

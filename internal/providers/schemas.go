@@ -1,11 +1,10 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package providers
 
 import (
 	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/configs/configschema"
 )
 
 // ProviderSchema is an overall container for all of the schemas for all
@@ -14,26 +13,54 @@ import (
 type ProviderSchema = GetProviderSchemaResponse
 
 // SchemaForResourceType attempts to find a schema for the given mode and type.
-// Returns nil if no such schema is available.
-func (ss ProviderSchema) SchemaForResourceType(mode addrs.ResourceMode, typeName string) (schema *configschema.Block, version uint64) {
+// Returns an empty schema if none is available.
+func (ss ProviderSchema) SchemaForResourceType(mode addrs.ResourceMode, typeName string) (schema Schema) {
 	switch mode {
 	case addrs.ManagedResourceMode:
-		res := ss.ResourceTypes[typeName]
-		return res.Body, uint64(res.Version)
+		return ss.ResourceTypes[typeName]
 	case addrs.DataResourceMode:
-		// Data resources don't have schema versions right now, since state is discarded for each refresh
-		return ss.DataSources[typeName].Body, 0
+		return ss.DataSources[typeName]
 	case addrs.EphemeralResourceMode:
-		// Ephemeral resources don't have schema versions because their objects never outlive a single phase
-		return ss.EphemeralResourceTypes[typeName].Body, 0
+		return ss.EphemeralResourceTypes[typeName]
+	case addrs.ListResourceMode:
+		return ss.ListResourceTypes[typeName]
 	default:
 		// Shouldn't happen, because the above cases are comprehensive.
-		return nil, 0
+		return Schema{}
 	}
 }
 
 // SchemaForResourceAddr attempts to find a schema for the mode and type from
-// the given resource address. Returns nil if no such schema is available.
-func (ss ProviderSchema) SchemaForResourceAddr(addr addrs.Resource) (schema *configschema.Block, version uint64) {
+// the given resource address. Returns an empty schema if none is available.
+func (ss ProviderSchema) SchemaForResourceAddr(addr addrs.Resource) (schema Schema) {
 	return ss.SchemaForResourceType(addr.Mode, addr.Type)
+}
+
+type ResourceIdentitySchemas = GetResourceIdentitySchemasResponse
+
+// SchemaForActionType attempts to find a schema for the given type. Returns an
+// empty schema if none is available.
+func (ss ProviderSchema) SchemaForActionType(typeName string) (schema ActionSchema) {
+	schema, ok := ss.Actions[typeName]
+	if ok {
+		return schema
+	}
+	return ActionSchema{}
+}
+
+// SchemaForListResourceType attempts to find a schema for the given type. Returns an
+// empty schema if none is available.
+func (ss ProviderSchema) SchemaForListResourceType(typeName string) ListResourceSchema {
+	schema, ok := ss.ListResourceTypes[typeName]
+	ret := ListResourceSchema{FullSchema: schema.Body}
+	if !ok || schema.Body == nil {
+		return ret
+	}
+	// The configuration for the list block is nested within a "config" block.
+	configSchema, ok := schema.Body.BlockTypes["config"]
+	if !ok {
+		return ret
+	}
+	ret.ConfigSchema = &configSchema.Block
+	return ret
 }

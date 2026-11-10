@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package configs
@@ -39,6 +39,10 @@ type Resource struct {
 	// For all other resource modes, this field is nil.
 	Managed *ManagedResource
 
+	// List is populated only for Mode = addrs.ListResourceMode,
+	// containing the additional fields that apply to list resources.
+	List *ListResource
+
 	// Container links a scoped resource back up to the resources that contains
 	// it. This field is referenced during static analysis to check whether any
 	// references are also made from within the same container.
@@ -52,16 +56,30 @@ type Resource struct {
 
 // ManagedResource represents a "resource" block in a module or file.
 type ManagedResource struct {
-	Connection   *Connection
-	Provisioners []*Provisioner
+	Connection     *Connection
+	Provisioners   []*Provisioner
+	ActionTriggers []*ActionTrigger
 
 	CreateBeforeDestroy bool
 	PreventDestroy      bool
+	Destroy             bool
 	IgnoreChanges       []hcl.Traversal
 	IgnoreAllChanges    bool
 
 	CreateBeforeDestroySet bool
 	PreventDestroySet      bool
+	DestroySet             bool
+}
+
+type ListResource struct {
+	// By default, the results of a list resource only include the identities of
+	// the discovered resources. If the user specifies "include_resources = true",
+	// then the provider should include the resource data in the result.
+	IncludeResource hcl.Expression
+
+	// Limit is an optional expression that can be used to limit the
+	// number of results returned by the list resource.
+	Limit hcl.Expression
 }
 
 func (r *Resource) moduleUniqueKey() string {
@@ -104,7 +122,7 @@ func (r *Resource) HasCustomConditions() bool {
 	return len(r.Postconditions) != 0 || len(r.Preconditions) != 0
 }
 
-func decodeResourceBlock(block *hcl.Block, override bool) (*Resource, hcl.Diagnostics) {
+func decodeResourceBlock(block *hcl.Block, override bool, allowExperiments bool) (*Resource, hcl.Diagnostics) {
 	var diags hcl.Diagnostics
 	r := &Resource{
 		Mode:      addrs.ManagedResourceMode,
@@ -204,6 +222,12 @@ func decodeResourceBlock(block *hcl.Block, override bool) (*Resource, hcl.Diagno
 				r.TriggersReplacement = append(r.TriggersReplacement, exprs...)
 			}
 
+			if attr, exists := lcContent.Attributes["destroy"]; exists {
+				valDiags := gohcl.DecodeExpression(attr.Expr, nil, &r.Managed.Destroy)
+				diags = append(diags, valDiags...)
+				r.Managed.DestroySet = true
+			}
+
 			if attr, exists := lcContent.Attributes["ignore_changes"]; exists {
 
 				// ignore_changes can either be a list of relative traversals
@@ -281,6 +305,14 @@ func decodeResourceBlock(block *hcl.Block, override bool) (*Resource, hcl.Diagno
 					case "postcondition":
 						r.Postconditions = append(r.Postconditions, cr)
 					}
+
+				case "action_trigger":
+					at, atDiags := decodeActionTriggerBlock(block)
+					diags = append(diags, atDiags...)
+					if at != nil {
+						r.Managed.ActionTriggers = append(r.Managed.ActionTriggers, at)
+					}
+
 				default:
 					// The cases above should be exhaustive for all block types
 					// defined in the lifecycle schema, so this shouldn't happen.
@@ -485,6 +517,13 @@ func decodeEphemeralBlock(block *hcl.Block, override bool) (*Resource, hcl.Diagn
 					case "postcondition":
 						r.Postconditions = append(r.Postconditions, cr)
 					}
+				case "action_trigger":
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Invalid ephemeral resource lifecycle nested block",
+						Detail:   fmt.Sprintf("The lifecycle nested block %q is defined only for managed resources (\"resource\" blocks), and is not valid for ephemeral resources.", block.Type),
+						Subject:  block.TypeRange.Ptr(),
+					})
 				default:
 					// The cases above should be exhaustive for all block types
 					// defined in the lifecycle schema, so this shouldn't happen.
@@ -661,6 +700,13 @@ func decodeDataBlock(block *hcl.Block, override, nested bool) (*Resource, hcl.Di
 					case "postcondition":
 						r.Postconditions = append(r.Postconditions, cr)
 					}
+				case "action_trigger":
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Invalid data resource lifecycle nested block",
+						Detail:   fmt.Sprintf("The lifecycle nested block %q is defined only for managed resources (\"resource\" blocks), and is not valid for data resources.", block.Type),
+						Subject:  block.TypeRange.Ptr(),
+					})
 				default:
 					// The cases above should be exhaustive for all block types
 					// defined in the lifecycle schema, so this shouldn't happen.
@@ -959,9 +1005,13 @@ var resourceLifecycleBlockSchema = &hcl.BodySchema{
 		{
 			Name: "replace_triggered_by",
 		},
+		{
+			Name: "destroy",
+		},
 	},
 	Blocks: []hcl.BlockHeaderSchema{
 		{Type: "precondition"},
 		{Type: "postcondition"},
+		{Type: "action_trigger"},
 	},
 }

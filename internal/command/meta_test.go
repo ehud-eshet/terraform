@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -14,9 +14,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/hashicorp/cli"
 	"github.com/hashicorp/terraform/internal/backend"
 	"github.com/hashicorp/terraform/internal/backend/local"
+	"github.com/hashicorp/terraform/internal/command/ui"
 	"github.com/hashicorp/terraform/internal/terraform"
 )
 
@@ -79,16 +79,20 @@ func TestMetaColorize(t *testing.T) {
 }
 
 func TestMetaInputMode(t *testing.T) {
-	test = false
-	defer func() { test = true }()
+	uiInput := ui.NewUIInputForTests(
+		ui.UIInputOptions{},
+		nil, nil,
+	)
 
 	m := new(Meta)
-	args := []string{}
-
-	fs := m.extendedFlagSet("foo")
-	if err := fs.Parse(args); err != nil {
-		t.Fatalf("err: %s", err)
+	m.testingOverrides = &testingOverrides{
+		UIInput: uiInput,
 	}
+
+	// In a command implementation, the -input flag would need to be parsed by logic in the `arguments`
+	// package, and the returned value used to set the `input` field on the Meta.
+	// So, this test simply verifies that the input mode is enabled when (Meta).input is true.
+	m.input = true
 
 	if m.InputMode() != terraform.InputModeStd {
 		t.Fatalf("bad: %#v", m.InputMode())
@@ -96,50 +100,92 @@ func TestMetaInputMode(t *testing.T) {
 }
 
 func TestMetaInputMode_envVar(t *testing.T) {
-	test = false
-	defer func() { test = true }()
-	old := os.Getenv(InputModeEnvVar)
-	defer os.Setenv(InputModeEnvVar, old)
+	t.Run("env var overrides input mode, if input is otherwise considered enabled", func(t *testing.T) {
+		// Ask for input
+		uiInput := ui.NewUIInputForTests(
+			ui.UIInputOptions{},
+			nil, nil,
+		)
 
-	m := new(Meta)
-	args := []string{}
-
-	fs := m.extendedFlagSet("foo")
-	if err := fs.Parse(args); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	off := terraform.InputMode(0)
-	on := terraform.InputModeStd
-	cases := []struct {
-		EnvVar   string
-		Expected terraform.InputMode
-	}{
-		{"false", off},
-		{"0", off},
-		{"true", on},
-		{"1", on},
-	}
-
-	for _, tc := range cases {
-		os.Setenv(InputModeEnvVar, tc.EnvVar)
-		if m.InputMode() != tc.Expected {
-			t.Fatalf("expected InputMode: %#v, got: %#v", tc.Expected, m.InputMode())
+		m := new(Meta)
+		m.testingOverrides = &testingOverrides{
+			UIInput: uiInput,
 		}
-	}
+
+		// Commands will set this value to true, which is the default value.
+		// The ENV only overrides if this value is set to true.
+		m.input = true
+
+		off := terraform.InputMode(0)
+		on := terraform.InputModeStd
+		cases := []struct {
+			EnvVar   string
+			Expected terraform.InputMode
+		}{
+			{"false", off},
+			{"0", off},
+			{"true", on},
+			{"1", on},
+		}
+
+		for _, tc := range cases {
+			t.Setenv(InputModeEnvVar, tc.EnvVar)
+			if m.InputMode() != tc.Expected {
+				t.Fatalf("expected InputMode: %#v, got: %#v", tc.Expected, m.InputMode())
+			}
+		}
+	})
+
+	t.Run("env var cannot enable input mode if it is disabled by -input=false", func(t *testing.T) {
+		// Ask for input
+		uiInput := ui.NewUIInputForTests(
+			ui.UIInputOptions{},
+			nil, nil,
+		)
+
+		m := new(Meta)
+		m.testingOverrides = &testingOverrides{
+			UIInput: uiInput,
+		}
+
+		// (Meta).input = false if a command receives -input=false as a CLI flag.
+		// Or, if the command is incorrectly implemented and ignores the -input flag.
+		m.input = false
+
+		off := terraform.InputMode(0)
+		cases := []struct {
+			EnvVar   string
+			Expected terraform.InputMode
+		}{
+			{"true", off},
+			{"1", off},
+		}
+
+		for _, tc := range cases {
+			t.Setenv(InputModeEnvVar, tc.EnvVar)
+			if m.InputMode() != tc.Expected {
+				t.Fatalf("expected InputMode: %#v, got: %#v", tc.Expected, m.InputMode())
+			}
+		}
+	})
 }
 
 func TestMetaInputMode_disable(t *testing.T) {
-	test = false
-	defer func() { test = true }()
+	// Ask for input
+	uiInput := ui.NewUIInputForTests(
+		ui.UIInputOptions{},
+		nil, nil,
+	)
 
 	m := new(Meta)
-	args := []string{"-input=false"}
-
-	fs := m.extendedFlagSet("foo")
-	if err := fs.Parse(args); err != nil {
-		t.Fatalf("err: %s", err)
+	m.testingOverrides = &testingOverrides{
+		UIInput: uiInput,
 	}
+
+	// In a command implementation, the -input flag would need to be parsed by logic in the `arguments`
+	// package, and the returned value used to set the `input` field on the Meta.
+	// So, this test simply verifies that the input mode is disabled when (Meta).input is false.
+	m.input = false
 
 	if m.InputMode() > 0 {
 		t.Fatalf("bad: %#v", m.InputMode())
@@ -186,7 +232,7 @@ func TestMeta_initStatePaths(t *testing.T) {
 func TestMeta_Env(t *testing.T) {
 	td := t.TempDir()
 	os.MkdirAll(td, 0755)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	m := new(Meta)
 
@@ -228,10 +274,7 @@ func TestMeta_StatePersistInterval(t *testing.T) {
 		}
 	})
 	t.Run("with valid interval greater than the default", func(t *testing.T) {
-		os.Setenv(StatePersistIntervalEnvVar, "25")
-		t.Cleanup(func() {
-			os.Unsetenv(StatePersistIntervalEnvVar)
-		})
+		t.Setenv(StatePersistIntervalEnvVar, "25")
 
 		interval := m.StatePersistInterval()
 		if interval != 25 {
@@ -239,10 +282,7 @@ func TestMeta_StatePersistInterval(t *testing.T) {
 		}
 	})
 	t.Run("with a valid interval less than the default", func(t *testing.T) {
-		os.Setenv(StatePersistIntervalEnvVar, "10")
-		t.Cleanup(func() {
-			os.Unsetenv(StatePersistIntervalEnvVar)
-		})
+		t.Setenv(StatePersistIntervalEnvVar, "10")
 
 		interval := m.StatePersistInterval()
 		if interval != DefaultStatePersistInterval {
@@ -250,10 +290,7 @@ func TestMeta_StatePersistInterval(t *testing.T) {
 		}
 	})
 	t.Run("with invalid integer interval", func(t *testing.T) {
-		os.Setenv(StatePersistIntervalEnvVar, "foo")
-		t.Cleanup(func() {
-			os.Unsetenv(StatePersistIntervalEnvVar)
-		})
+		t.Setenv(StatePersistIntervalEnvVar, "foo")
 
 		interval := m.StatePersistInterval()
 		if interval != DefaultStatePersistInterval {
@@ -261,10 +298,7 @@ func TestMeta_StatePersistInterval(t *testing.T) {
 		}
 	})
 	t.Run("with negative integer interval", func(t *testing.T) {
-		os.Setenv(StatePersistIntervalEnvVar, "-10")
-		t.Cleanup(func() {
-			os.Unsetenv(StatePersistIntervalEnvVar)
-		})
+		t.Setenv(StatePersistIntervalEnvVar, "-10")
 
 		interval := m.StatePersistInterval()
 		if interval != DefaultStatePersistInterval {
@@ -273,11 +307,8 @@ func TestMeta_StatePersistInterval(t *testing.T) {
 	})
 }
 
+// Invalid workspace names provided via ENV are validated.
 func TestMeta_Workspace_override(t *testing.T) {
-	defer func(value string) {
-		os.Setenv(WorkspaceNameEnvVar, value)
-	}(os.Getenv(WorkspaceNameEnvVar))
-
 	m := new(Meta)
 
 	testCases := map[string]struct {
@@ -300,7 +331,7 @@ func TestMeta_Workspace_override(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			os.Setenv(WorkspaceNameEnvVar, name)
+			t.Setenv(WorkspaceNameEnvVar, name)
 			workspace, err := m.Workspace()
 			if workspace != tc.workspace {
 				t.Errorf("Unexpected workspace\n got: %s\nwant: %s\n", workspace, tc.workspace)
@@ -314,8 +345,7 @@ func TestMeta_Workspace_override(t *testing.T) {
 
 func TestMeta_Workspace_invalidSelected(t *testing.T) {
 	td := t.TempDir()
-	os.MkdirAll(td, 0755)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
 	// this is an invalid workspace name
 	workspace := "test workspace"
@@ -329,13 +359,25 @@ func TestMeta_Workspace_invalidSelected(t *testing.T) {
 	if err := os.MkdirAll(DefaultDataDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile(filepath.Join(DefaultDataDir, local.DefaultWorkspaceFile), []byte(workspace), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(DefaultDataDir, local.DefaultWorkspaceFile), []byte(workspace), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	m := new(Meta)
 
+	// Normally, errors are returned when selecting an invalid workspace.
 	ws, err := m.Workspace()
+	if ws != "" {
+		t.Errorf("Unexpected workspace\n got: %s\nwant: %s\n", ws, workspace)
+	}
+	if err == nil {
+		t.Errorf("Expected error but got none")
+	}
+
+	// But it is possible to select an invalid workspace, enabling some
+	// commands to interact with and correct the issue.
+	m.bypassWorkspaceNameValidityCheck = true
+	ws, err = m.Workspace()
 	if ws != workspace {
 		t.Errorf("Unexpected workspace\n got: %s\nwant: %s\n", ws, workspace)
 	}
@@ -345,13 +387,10 @@ func TestMeta_Workspace_invalidSelected(t *testing.T) {
 }
 
 func TestMeta_process(t *testing.T) {
-	test = false
-	defer func() { test = true }()
-
 	// Create a temporary directory for our cwd
 	d := t.TempDir()
 	os.MkdirAll(d, 0755)
-	defer testChdir(t, d)()
+	t.Chdir(d)
 
 	// At one point it was the responsibility of this process function to
 	// insert fake additional -var-file options into the command line
@@ -427,7 +466,16 @@ func TestMeta_process(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%s", test.GivenArgs), func(t *testing.T) {
+			uiInput := ui.NewUIInputForTests(
+				ui.UIInputOptions{},
+				nil,
+				nil,
+			)
+
 			m := new(Meta)
+			m.testingOverrides = &testingOverrides{
+				UIInput: uiInput,
+			}
 			m.Color = true // this is the default also for normal use, overridden by -no-color
 			args := test.GivenArgs
 			args = m.process(args)
@@ -447,9 +495,9 @@ func TestCommand_checkRequiredVersion(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("command-check-required-version"), td)
-	defer testChdir(t, td)()
+	t.Chdir(td)
 
-	ui := cli.NewMockUi()
+	ui := testUiWrapped(t)
 	meta := Meta{
 		Ui: ui,
 	}
@@ -468,5 +516,42 @@ func TestCommand_checkRequiredVersion(t *testing.T) {
 	}
 	if strings.Contains(errStr, `required_version = ">= 0.13.0"`) {
 		t.Fatalf("output should not point to met version constraint, but is:\n\n%s", errStr)
+	}
+}
+
+func TestTestingOverrides_Input(t *testing.T) {
+	cases := []struct {
+		name             string
+		testingOverrides *testingOverrides
+		expected         bool
+	}{
+		{
+			name:             "nil testingOverrides",
+			testingOverrides: nil,
+			expected:         true,
+		},
+		{
+			name: "UIInput set",
+			testingOverrides: &testingOverrides{
+				UIInput: ui.NewUIInputForTests(ui.UIInputOptions{}, nil, nil),
+			},
+			expected: true,
+		},
+		{
+			name: "UIInput not set in testingOverrides",
+			testingOverrides: &testingOverrides{
+				UIInput: nil,
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.testingOverrides.Input()
+			if got != tc.expected {
+				t.Errorf("got %v; want %v", got, tc.expected)
+			}
+		})
 	}
 }

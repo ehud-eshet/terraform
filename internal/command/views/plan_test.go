@@ -1,9 +1,10 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package views
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/zclconf/go-cty/cty"
@@ -16,6 +17,7 @@ import (
 	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/terminal"
 	"github.com/hashicorp/terraform/internal/terraform"
+	"github.com/hashicorp/terraform/version"
 )
 
 // Ensure that the correct view type and in-automation settings propagate to the
@@ -134,6 +136,37 @@ func testPlanWithDatasource(t *testing.T) *plans.Plan {
 	return plan
 }
 
+func testPlanWithDeferredChanges(t *testing.T) *plans.Plan {
+	t.Helper()
+
+	plan := testPlan(t)
+
+	deferredAddr := addrs.Resource{
+		Mode: addrs.ManagedResourceMode,
+		Type: "test_resource",
+		Name: "deferred",
+	}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance)
+
+	plan.DeferredResources = []*plans.DeferredResourceInstanceChangeSrc{
+		{
+			DeferredReason: providers.DeferredReasonResourceConfigUnknown,
+			ChangeSrc: &plans.ResourceInstanceChangeSrc{
+				Addr:        deferredAddr,
+				PrevRunAddr: deferredAddr,
+				ProviderAddr: addrs.AbsProviderConfig{
+					Provider: addrs.NewDefaultProvider("test"),
+					Module:   addrs.RootModule,
+				},
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Create,
+				},
+			},
+		},
+	}
+
+	return plan
+}
+
 func testSchemas() *terraform.Schemas {
 	provider := testProvider()
 	return &terraform.Schemas{
@@ -180,4 +213,38 @@ func testProviderSchema() *providers.GetProviderSchemaResponse {
 			},
 		},
 	}
+}
+
+func TestNewPlan_Version(t *testing.T) {
+	t.Run("json view", func(t *testing.T) {
+		streams, done := terminal.StreamsForTesting(t)
+		v := NewPlan(arguments.ViewJSON, NewView(streams))
+
+		v.Version()
+
+		want := []map[string]interface{}{
+			{
+				"@level":    "info",
+				"@message":  fmt.Sprintf("Terraform %s", version.String()),
+				"@module":   "terraform.ui",
+				"type":      "version",
+				"terraform": version.String(),
+				"ui":        JSON_UI_VERSION,
+			},
+		}
+		testJSONViewOutputEquals(t, done(t).Stdout(), want)
+	})
+
+	t.Run("human view", func(t *testing.T) {
+		streams, done := terminal.StreamsForTesting(t)
+		v := NewPlan(arguments.ViewHuman, NewView(streams))
+
+		v.Version()
+
+		got := done(t).Stdout()
+		want := ""
+		if got != want {
+			t.Fatalf("expected output %q, got %q", want, got)
+		}
+	})
 }

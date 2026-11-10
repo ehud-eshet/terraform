@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hashicorp/cli"
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/clistate"
@@ -16,29 +15,42 @@ import (
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
-// StateRmCommand is a Command implementation that shows a single resource.
+// StateRmCommand is a Command implementation that removes
+// a single resource from the state.
 type StateRmCommand struct {
 	StateMeta
 }
 
 func (c *StateRmCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	var dryRun bool
-	cmdFlags := c.Meta.ignoreRemoteVersionFlagSet("state rm")
-	cmdFlags.BoolVar(&dryRun, "dry-run", false, "dry run")
-	cmdFlags.StringVar(&c.backupPath, "backup", "-", "backup")
-	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
-	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
-	cmdFlags.StringVar(&c.statePath, "state", "", "path")
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
+	var diags tfdiags.Diagnostics
+
+	parsedArgs, parseDiags := arguments.ParseStateRm(c.Meta.process(args))
+	diags = diags.Append(parseDiags)
+	if diags.HasErrors() {
+		c.showDiagnostics(diags)
 		return 1
 	}
 
-	args = cmdFlags.Args()
-	if len(args) < 1 {
-		c.Ui.Error("At least one address is required.\n")
-		return cli.RunResultHelp
+	c.backupPath = parsedArgs.BackupPath
+	c.Meta.stateLock = parsedArgs.StateLock
+	c.Meta.stateLockTimeout = parsedArgs.StateLockTimeout
+	c.statePath = parsedArgs.StatePath
+	c.Meta.ignoreRemoteVersion = parsedArgs.IgnoreRemoteVersion
+
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(err)
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	var varDiags tfdiags.Diagnostics
+	c.VariableValues, varDiags = parsedArgs.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	if varDiags.HasErrors() {
+		c.showDiagnostics(varDiags)
+		return 1
 	}
 
 	if diags := c.Meta.checkRequiredVersion(); diags != nil {
@@ -47,9 +59,11 @@ func (c *StateRmCommand) Run(args []string) int {
 	}
 
 	// Get the state
-	stateMgr, err := c.State()
+	view := arguments.ViewHuman
+	stateMgr, err := c.State(view)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateLoadingState, err))
+		diags = diags.Append(fmt.Errorf(errStateLoadingState, err))
+		c.showDiagnostics(diags)
 		return 1
 	}
 
@@ -67,21 +81,26 @@ func (c *StateRmCommand) Run(args []string) int {
 	}
 
 	if err := stateMgr.RefreshState(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to refresh state: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to refresh the state",
+			fmt.Sprintf("Error refreshing the state: %s", err),
+		))
+		c.showDiagnostics(diags)
 		return 1
 	}
 
 	state := stateMgr.State()
 	if state == nil {
-		c.Ui.Error(errStateNotFound)
+		diags = diags.Append(errStateNotFound)
+		c.showDiagnostics(diags)
 		return 1
 	}
 
 	// This command primarily works with resource instances, though it will
 	// also clean up any modules and resources left empty by actions it takes.
 	var addrs []addrs.AbsResourceInstance
-	var diags tfdiags.Diagnostics
-	for _, addrStr := range args {
+	for _, addrStr := range parsedArgs.Addrs {
 		moreAddrs, moreDiags := c.lookupResourceInstanceAddr(state, true, addrStr)
 		addrs = append(addrs, moreAddrs...)
 		diags = diags.Append(moreDiags)
@@ -91,30 +110,39 @@ func (c *StateRmCommand) Run(args []string) int {
 		return 1
 	}
 
-	prefix := "Removed "
-	if dryRun {
-		prefix = "Would remove "
-	}
-
-	var isCount int
+	removals := []string{}
 	ss := state.SyncWrapper()
 	for _, addr := range addrs {
-		isCount++
-		c.Ui.Output(prefix + addr.String())
-		if !dryRun {
+		removals = append(removals, addr.String())
+		if !parsedArgs.DryRun {
 			ss.ForgetResourceInstanceAll(addr)
 			ss.RemoveResourceIfEmpty(addr.ContainingResource())
 		}
 	}
 
-	if dryRun {
-		if isCount == 0 {
+	if parsedArgs.DryRun {
+		if len(removals) == 0 {
 			c.Ui.Output("Would have removed nothing.")
+		} else {
+			for _, removal := range removals {
+				c.Ui.Output("Would remove " + removal)
+			}
 		}
 		return 0 // This is as far as we go in dry-run mode
 	}
 
-	b, backendDiags := c.Backend(nil)
+	if len(removals) == 0 {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Invalid target address",
+			"No matching objects found. To view the available instances, use \"terraform state list\". Please modify the address to reference a specific instance.",
+		))
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	// Load the backend
+	b, backendDiags := c.backend(".", view)
 	diags = diags.Append(backendDiags)
 	if backendDiags.HasErrors() {
 		c.showDiagnostics(diags)
@@ -130,29 +158,23 @@ func (c *StateRmCommand) Run(args []string) int {
 	}
 
 	if err := stateMgr.WriteState(state); err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateRmPersist, err))
+		diags = diags.Append(stateRmPersistErrDiag(err))
+		c.showDiagnostics(diags)
 		return 1
 	}
 	if err := stateMgr.PersistState(schemas); err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateRmPersist, err))
-		return 1
-	}
-
-	if len(diags) > 0 && isCount != 0 {
-		c.showDiagnostics(diags)
-	}
-
-	if isCount == 0 {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"Invalid target address",
-			"No matching objects found. To view the available instances, use \"terraform state list\". Please modify the address to reference a specific instance.",
-		))
+		diags = diags.Append(stateRmPersistErrDiag(err))
 		c.showDiagnostics(diags)
 		return 1
 	}
 
-	c.Ui.Output(fmt.Sprintf("Successfully removed %d resource instance(s).", isCount))
+	for _, removal := range removals {
+		c.Ui.Output("Removed " + removal)
+	}
+
+	c.showDiagnostics(diags)
+
+	c.Ui.Output(fmt.Sprintf("Successfully removed %d resource instance(s).", len(removals)))
 	return 0
 }
 
@@ -189,10 +211,22 @@ Options:
 
   -state=PATH             Path to the state file to update. Defaults to the
                           current workspace state.
+                          Legacy option for the local backend only. See
+                          the local backend's documentation for more
+                          information.
 
   -ignore-remote-version  Continue even if remote and local Terraform versions
                           are incompatible. This may result in an unusable
                           workspace, and should be used with extreme caution.
+
+  -var 'foo=bar'          Set a value for one of the input variables in the root
+                          module of the configuration. Use this option more than
+                          once to set more than one variable.
+
+  -var-file=filename      Load variable values from the given file, in addition
+                          to the default files terraform.tfvars and *.auto.tfvars.
+                          Use this option more than once to include more than one
+                          variables file.
 
 `
 	return strings.TrimSpace(helpText)
@@ -202,8 +236,13 @@ func (c *StateRmCommand) Synopsis() string {
 	return "Remove instances from the state"
 }
 
-const errStateRmPersist = `Error saving the state: %s
+func stateRmPersistErrDiag(err error) tfdiags.Diagnostic {
+	return tfdiags.Sourceless(
+		tfdiags.Error,
+		"Failed to save the state",
+		fmt.Sprintf(`Terraform encountered an error when saving state: %s
 
 The state was not saved. No items were removed from the persisted
-state. No backup was created since no modification occurred. Please
-resolve the issue above and try again.`
+state. Please resolve the issue above and try again.`, err),
+	)
+}

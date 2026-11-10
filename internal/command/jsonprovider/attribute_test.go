@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package jsonprovider
@@ -19,12 +19,20 @@ func TestMarshalAttribute(t *testing.T) {
 		Want  *Attribute
 	}{
 		{
-			&configschema.Attribute{Type: cty.String, Optional: true, Computed: true},
+			&configschema.Attribute{
+				Type:               cty.String,
+				Optional:           true,
+				Computed:           true,
+				Deprecated:         true,
+				DeprecationMessage: "This is a deprecated attribute",
+			},
 			&Attribute{
-				AttributeType:   json.RawMessage(`"string"`),
-				Optional:        true,
-				Computed:        true,
-				DescriptionKind: "plain",
+				AttributeType:      json.RawMessage(`"string"`),
+				Optional:           true,
+				Computed:           true,
+				DescriptionKind:    "plain",
+				Deprecated:         true,
+				DeprecationMessage: "This is a deprecated attribute",
 			},
 		},
 		{ // collection types look a little odd.
@@ -45,4 +53,34 @@ func TestMarshalAttribute(t *testing.T) {
 			t.Fatalf("wrong result:\n %v\n", cmp.Diff(got, test.Want))
 		}
 	}
+}
+
+func TestMarshalIdentityAttribute(t *testing.T) {
+	tests := []struct {
+		Input *configschema.Attribute
+		Want  *IdentityAttribute
+	}{
+		{
+			&configschema.Attribute{Type: cty.String, Optional: true},
+			&IdentityAttribute{
+				IdentityType:      json.RawMessage(`"string"`),
+				OptionalForImport: true,
+			},
+		},
+		{ // collection types look a little odd.
+			&configschema.Attribute{Type: cty.List(cty.String), Required: true},
+			&IdentityAttribute{
+				IdentityType:      json.RawMessage(`["list","string"]`),
+				RequiredForImport: true,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		got := marshalIdentityAttribute(test.Input)
+		if !cmp.Equal(got, test.Want) {
+			t.Fatalf("wrong result:\n %v\n", cmp.Diff(got, test.Want))
+		}
+	}
+
 }

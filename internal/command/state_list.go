@@ -1,14 +1,16 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/hashicorp/cli"
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/command/arguments"
+	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -20,26 +22,34 @@ type StateListCommand struct {
 	StateMeta
 }
 
-func (c *StateListCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	var statePath string
-	cmdFlags := c.Meta.defaultFlagSet("state list")
-	cmdFlags.StringVar(&statePath, "state", "", "path")
-	lookupId := cmdFlags.String("id", "", "Restrict output to paths with a resource having the specified ID.")
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
-		return cli.RunResultHelp
-	}
-	args = cmdFlags.Args()
+func (c *StateListCommand) Run(rawArgs []string) int {
+	var diags tfdiags.Diagnostics
 
-	if statePath != "" {
-		c.Meta.statePath = statePath
+	// Parse and apply global view arguments
+	common, rawArgs := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
+
+	// Process command-specific arguments.
+	parsedArgs, parseDiags := arguments.ParseStateList(rawArgs)
+	diags = diags.Append(parseDiags)
+
+	// Prepare the view
+	view := views.NewStateList(parsedArgs.ViewType, c.View)
+
+	// Now the view is ready, process any error diagnostics from parsing arguments.
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	if parsedArgs.StatePath != "" {
+		c.Meta.statePath = parsedArgs.StatePath
 	}
 
 	// Load the backend
-	b, backendDiags := c.Backend(nil)
-	if backendDiags.HasErrors() {
-		c.showDiagnostics(backendDiags)
+	b, diags := c.backend(".", parsedArgs.ViewType)
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -49,47 +59,57 @@ func (c *StateListCommand) Run(args []string) int {
 	// Get the state
 	env, err := c.Workspace()
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error selecting workspace: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to select workspace",
+			fmt.Sprintf("Error selecting workspace: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
-	stateMgr, err := b.StateMgr(env)
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateLoadingState, err))
+	stateMgr, sDiags := b.StateMgr(env)
+	if sDiags.HasErrors() {
+		diags = diags.Append(fmt.Errorf(errStateLoadingState, sDiags.Err()))
+		view.Diagnostics(diags)
 		return 1
 	}
 	if err := stateMgr.RefreshState(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to refresh the state",
+			fmt.Sprintf("Error refreshing the state: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	state := stateMgr.State()
 	if state == nil {
-		c.Ui.Error(errStateNotFound)
+		diags = diags.Append(errStateNotFound)
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	var addrs []addrs.AbsResourceInstance
-	var diags tfdiags.Diagnostics
-	if len(args) == 0 {
+	if len(parsedArgs.Addrs) == 0 {
 		addrs, diags = c.lookupAllResourceInstanceAddrs(state)
 	} else {
-		addrs, diags = c.lookupResourceInstanceAddrs(state, args...)
+		addrs, diags = c.lookupResourceInstanceAddrs(state, parsedArgs.Addrs...)
 	}
 	if diags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
+	addresses := []string{}
 	for _, addr := range addrs {
 		if is := state.ResourceInstance(addr); is != nil {
-			if *lookupId == "" || *lookupId == states.LegacyInstanceObjectID(is.Current) {
-				c.Ui.Output(addr.String())
+			if parsedArgs.ID == "" || parsedArgs.ID == states.LegacyInstanceObjectID(is.Current) {
+				addresses = append(addresses, addr.String())
 			}
 		}
 	}
-
-	c.showDiagnostics(diags)
-
+	view.List(addresses, diags)
 	return 0
 }
 
@@ -115,15 +135,20 @@ Usage: terraform [global options] state list [options] [address...]
 
 Options:
 
-  -state=statefile    Path to a Terraform state file to use to look
-                      up Terraform-managed resources. By default, Terraform
-                      will consult the state of the currently-selected
-                      workspace.
-
   -id=ID              Filters the results to include only instances whose
                       resource types have an attribute named "id" whose value
                       equals the given id string.
 
+  -compact-warnings   If Terraform produces any warnings that are not
+                      accompanied by errors, show them in a more compact
+                      form that includes only the summary messages
+
+  -no-color           Disable text coloring in the output.
+
+  -state=statefile    Path to a Terraform state file to use to look
+                      up Terraform-managed resources. By default, Terraform
+                      will consult the state of the currently-selected
+                      workspace.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -138,8 +163,8 @@ Please ensure that your Terraform state exists and that you've
 configured it properly. You can use the "-state" flag to point
 Terraform at another state file.`
 
-const errStateNotFound = `No state file was found!
+var errStateNotFound = errors.New(`No state file was found!
 
 State management commands require a state file. Run this command
 in a directory where Terraform has been run or use the -state flag
-to point the command to a specific state location.`
+to point the command to a specific state location.`)

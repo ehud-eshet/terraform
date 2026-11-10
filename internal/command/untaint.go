@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -22,92 +22,113 @@ type UntaintCommand struct {
 	Meta
 }
 
-func (c *UntaintCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	var allowMissing bool
-	cmdFlags := c.Meta.ignoreRemoteVersionFlagSet("untaint")
-	cmdFlags.BoolVar(&allowMissing, "allow-missing", false, "allow missing")
-	cmdFlags.StringVar(&c.Meta.backupPath, "backup", "", "path")
-	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
-	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
-	cmdFlags.StringVar(&c.Meta.statePath, "state", "", "path")
-	cmdFlags.StringVar(&c.Meta.stateOutPath, "state-out", "", "path")
-	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
-		return 1
-	}
-
+func (c *UntaintCommand) Run(rawArgs []string) int {
 	var diags tfdiags.Diagnostics
 
-	// Require the one argument for the resource to untaint
-	args = cmdFlags.Args()
-	if len(args) != 1 {
-		c.Ui.Error("The untaint command expects exactly one argument.")
-		cmdFlags.Usage()
+	// Parse and apply global view arguments
+	common, rawArgs := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
+
+	// Parse command-specific arguments.
+	parsedArgs, parseDiags := arguments.ParseUntaint(rawArgs)
+	diags = diags.Append(parseDiags)
+
+	// Prepare the view
+	view := views.NewUntaint(parsedArgs.ViewType, c.View)
+
+	// Now the view is ready, process any error diagnostics from parsing arguments.
+	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	addr, addrDiags := addrs.ParseAbsResourceInstanceStr(args[0])
+	// Copy parsed flags to Meta
+	c.Meta.backupPath = parsedArgs.BackupPath
+	c.Meta.stateLock = parsedArgs.StateLock
+	c.Meta.stateLockTimeout = parsedArgs.StateLockTimeout
+	c.Meta.statePath = parsedArgs.StatePath
+	c.Meta.stateOutPath = parsedArgs.StateOutPath
+	c.Meta.ignoreRemoteVersion = parsedArgs.IgnoreRemoteVersion
+
+	addr, addrDiags := addrs.ParseAbsResourceInstanceStr(parsedArgs.Address)
 	diags = diags.Append(addrDiags)
 	if addrDiags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Load the backend
-	b, backendDiags := c.Backend(nil)
+	b, backendDiags := c.backend(".", parsedArgs.ViewType)
 	diags = diags.Append(backendDiags)
 	if backendDiags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Determine the workspace name
 	workspace, err := c.Workspace()
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error selecting workspace: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to determine the current workspace",
+			err.Error(),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Check remote Terraform version is compatible
 	remoteVersionDiags := c.remoteVersionCheck(b, workspace)
 	diags = diags.Append(remoteVersionDiags)
-	c.showDiagnostics(diags)
 	if diags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	// Get the state
-	stateMgr, err := b.StateMgr(workspace)
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
+	// Get a state manager for the current workspace
+	stateMgr, sDiags := b.StateMgr(workspace)
+	if sDiags.HasErrors() {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to access state",
+			fmt.Sprintf("Failed to access state: %s", sDiags.Err()),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	if c.stateLock {
 		stateLocker := clistate.NewLocker(c.stateLockTimeout, views.NewStateLocker(arguments.ViewHuman, c.View))
-		if diags := stateLocker.Lock(stateMgr, "untaint"); diags.HasErrors() {
-			c.showDiagnostics(diags)
+		if lockDiags := stateLocker.Lock(stateMgr, "untaint"); lockDiags.HasErrors() {
+			diags = diags.Append(lockDiags)
+			view.Diagnostics(diags)
 			return 1
 		}
 		defer func() {
-			if diags := stateLocker.Unlock(); diags.HasErrors() {
-				c.showDiagnostics(diags)
+			if unlockDiags := stateLocker.Unlock(); unlockDiags.HasErrors() {
+				diags = diags.Append(unlockDiags)
+				view.Diagnostics(diags)
 			}
 		}()
 	}
 
 	if err := stateMgr.RefreshState(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to load state",
+			fmt.Sprintf("Failed to load state: %s", err),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Get the actual state structure
 	state := stateMgr.State()
 	if state.Empty() {
-		if allowMissing {
-			return c.allowMissingExit(addr)
+		if parsedArgs.AllowMissing {
+			diags = diags.Append(c.allowMissingWarning(addr))
+			view.Diagnostics(diags)
+			return 0
 		}
 
 		diags = diags.Append(tfdiags.Sourceless(
@@ -115,7 +136,7 @@ func (c *UntaintCommand) Run(args []string) int {
 			"No such resource instance",
 			"The state currently contains no resource instances whatsoever. This may occur if the configuration has never been applied or if it has recently been destroyed.",
 		))
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -125,8 +146,10 @@ func (c *UntaintCommand) Run(args []string) int {
 	rs := ss.Resource(addr.ContainingResource())
 	is := ss.ResourceInstance(addr)
 	if is == nil {
-		if allowMissing {
-			return c.allowMissingExit(addr)
+		if parsedArgs.AllowMissing {
+			diags = diags.Append(c.allowMissingWarning(addr))
+			view.Diagnostics(diags)
+			return 0
 		}
 
 		diags = diags.Append(tfdiags.Sourceless(
@@ -134,7 +157,7 @@ func (c *UntaintCommand) Run(args []string) int {
 			"No such resource instance",
 			fmt.Sprintf("There is no resource instance in the state with the address %s. If the resource configuration has just been added, you must run \"terraform apply\" once to create the corresponding instance(s) before they can be tainted.", addr),
 		))
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -151,10 +174,10 @@ func (c *UntaintCommand) Run(args []string) int {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"No such resource instance",
-				fmt.Sprintf("Resource instance %s does not currently have a remote object associated with it, so it cannot be tainted.", addr),
+				fmt.Sprintf("Resource instance %s does not currently have a remote object associated with it, so it cannot be untainted.", addr),
 			))
 		}
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -164,7 +187,7 @@ func (c *UntaintCommand) Run(args []string) int {
 			"Resource instance is not tainted",
 			fmt.Sprintf("Resource instance %s is not currently tainted, and so it cannot be untainted.", addr),
 		))
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -180,16 +203,25 @@ func (c *UntaintCommand) Run(args []string) int {
 	ss.SetResourceInstanceCurrent(addr, obj, rs.ProviderConfig)
 
 	if err := stateMgr.WriteState(state); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error writing state file: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to write to state file",
+			err.Error(),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 	if err := stateMgr.PersistState(schemas); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error writing state file: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to write to state file",
+			err.Error(),
+		))
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	c.showDiagnostics(diags)
-	c.Ui.Output(fmt.Sprintf("Resource instance %s has been successfully untainted.", addr))
+	view.LogResourceUntainted(addr, diags)
 	return 0
 }
 
@@ -214,14 +246,20 @@ Options:
   -allow-missing          If specified, the command will succeed (exit code 0)
                           even if the resource is missing.
 
+  -compact-warnings       If Terraform produces any warnings that are not
+                          accompanied by errors, show them in a more compact
+                          form that includes only the summary messages
+
+  -ignore-remote-version  A rare option used for the remote backend only. See
+                          the remote backend documentation for more information.
+
   -lock=false             Don't hold a state lock during the operation. This is
                           dangerous if others might concurrently run commands
                           against the same workspace.
 
   -lock-timeout=0s        Duration to retry a state lock.
 
-  -ignore-remote-version  A rare option used for the remote backend only. See
-                          the remote backend documentation for more information.
+  -no-color               Disable text coloring in the output.
 
   -state, state-out, and -backup are legacy options supported for the local
   backend only. For more information, see the local backend's documentation.
@@ -234,11 +272,10 @@ func (c *UntaintCommand) Synopsis() string {
 	return "Remove the 'tainted' state from a resource instance"
 }
 
-func (c *UntaintCommand) allowMissingExit(name addrs.AbsResourceInstance) int {
-	c.showDiagnostics(tfdiags.Sourceless(
+func (c *UntaintCommand) allowMissingWarning(name addrs.AbsResourceInstance) tfdiags.Diagnostic {
+	return tfdiags.Sourceless(
 		tfdiags.Warning,
 		"No such resource instance",
 		fmt.Sprintf("Resource instance %s was not found, but this is not an error because -allow-missing was set.", name),
-	))
-	return 0
+	)
 }

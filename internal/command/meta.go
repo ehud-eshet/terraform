@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -7,10 +7,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,8 +19,9 @@ import (
 
 	"github.com/hashicorp/cli"
 	plugin "github.com/hashicorp/go-plugin"
-	"github.com/hashicorp/terraform-svchost/disco"
 	"github.com/mitchellh/colorstring"
+
+	"github.com/hashicorp/terraform-svchost/disco"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/backend"
@@ -28,12 +29,14 @@ import (
 	"github.com/hashicorp/terraform/internal/backend/local"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/format"
+	"github.com/hashicorp/terraform/internal/command/ui"
 	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/command/webbrowser"
 	"github.com/hashicorp/terraform/internal/command/workdir"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configload"
 	"github.com/hashicorp/terraform/internal/getproviders"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/states"
@@ -71,11 +74,18 @@ type Meta struct {
 	// do some default behavior instead if so, rather than panicking.
 	Streams *terminal.Streams
 
-	View *views.View
+	// View is the newer abstraction used for output from Terraform operations.
+	// View allows output to be rendered differently, depending on CLI settings.
+	// Currently the only non-default option is machine-readable output using  the`-json` flag.
+	// We are slowly migrating Terraform operations away from using `cli.Ui` and towards
+	// using `views.View`, and so far only the commands with machine-readable output features are
+	// migrated.
+	// For more information see: https://github.com/hashicorp/terraform/issues/37439
+	View *views.View // View for output
 
 	Color            bool     // True if output should be colored
 	GlobalPluginDirs []string // Additional paths to search for plugins
-	Ui               cli.Ui   // Ui for output
+	Ui               cli.Ui   // Ui for output. See View above.
 
 	// Services provides access to remote endpoint information for
 	// "terraform-native' services running at a specific user-facing hostname.
@@ -178,6 +188,8 @@ type Meta struct {
 	// flag is set, to reinforce that experiments are not for production use.
 	AllowExperimentalFeatures bool
 
+	VariableValues map[string]arguments.UnparsedVariableValue
+
 	//----------------------------------------------------------
 	// Protected: commands can set these
 	//----------------------------------------------------------
@@ -191,6 +203,10 @@ type Meta struct {
 	// Override certain behavior for tests within this package
 	testingOverrides *testingOverrides
 
+	// Overrides checking the validity of the workspace name set in .terraform/environment (not ENVs).
+	// This is to enable commands used to recover from invalid workspaces to run without the error blocking them.
+	bypassWorkspaceNameValidityCheck bool
+
 	//----------------------------------------------------------
 	// Private: do not set these
 	//----------------------------------------------------------
@@ -200,15 +216,16 @@ type Meta struct {
 	// It is initialized on first use.
 	configLoader *configload.Loader
 
-	// backendState is the currently active backend state
-	backendState *workdir.BackendState
+	// backendConfigState is the currently active backend state.
+	// This is used when creating plan files.
+	backendConfigState *workdir.BackendConfigState
+	// stateStoreConfigState is the currently active state_store state.
+	// This is used when creating plan files.
+	stateStoreConfigState *workdir.StateStoreConfigState
 
-	// Variables for the context (private)
-	variableArgs arguments.FlagNameValueSlice
-	input        bool
+	input bool
 
 	// Targets for this context (private)
-	targets     []addrs.Targetable
 	targetFlags []string
 
 	// Internal fields
@@ -264,11 +281,35 @@ type Meta struct {
 	// Used with commands which write state to allow users to write remote
 	// state even if the remote and local Terraform versions don't match.
 	ignoreRemoteVersion bool
+
+	// set to true if query files should be parsed
+	includeQueryFiles bool
+
+	// set to true if state migration files should be parsed
+	includeStateMigrateFiles bool
 }
 
 type testingOverrides struct {
 	Providers    map[addrs.Provider]providers.Factory
 	Provisioners map[string]provisioners.Factory
+	PolicyClient policy.Client
+
+	// UIInput is used to override the default input mechanism for tests.
+	// By setting a value here, input will become enabled.
+	// If this is not set, input will be considered disabled.
+	UIInput ui.InputRequester
+}
+
+func (to *testingOverrides) Input() bool {
+	if to == nil {
+		// This path covers non-test scenarios and also tests where no overrides are present.
+		return true
+	}
+
+	// If a test's testingOverrides provides a UIInput we say input is enabled.
+	// If a test's testingOverrides hasn't provided a UIInput we say input is disabled, as this
+	// prevents those tests from timing out waiting for input.
+	return to.UIInput != nil
 }
 
 // initStatePaths is used to initialize the default values for
@@ -293,9 +334,7 @@ func (m *Meta) StateOutPath() string {
 // Colorize returns the colorization structure for a command.
 func (m *Meta) Colorize() *colorstring.Colorize {
 	colors := make(map[string]string)
-	for k, v := range colorstring.DefaultColors {
-		colors[k] = v
-	}
+	maps.Copy(colors, colorstring.DefaultColors)
 	colors["purple"] = "38;5;57"
 
 	return &colorstring.Colorize{
@@ -336,7 +375,7 @@ const (
 // InputMode returns the type of input we should ask for in the form of
 // terraform.InputMode which is passed directly to Context.Input.
 func (m *Meta) InputMode() terraform.InputMode {
-	if test || !m.input {
+	if !m.testingOverrides.Input() || !m.input {
 		return 0
 	}
 
@@ -356,9 +395,16 @@ func (m *Meta) InputMode() terraform.InputMode {
 
 // UIInput returns a UIInput object to be used for asking for input.
 func (m *Meta) UIInput() terraform.UIInput {
-	return &UIInput{
+	// Tests can override the UIInput object.
+	if m.testingOverrides != nil &&
+		m.testingOverrides.UIInput != nil {
+		return m.testingOverrides.UIInput
+	}
+
+	opts := ui.UIInputOptions{
 		Colorize: m.Colorize(),
 	}
+	return ui.NewUIInput(opts)
 }
 
 // OutputColumns returns the number of columns that normal (non-error) UI
@@ -475,7 +521,7 @@ func (m *Meta) RunOperation(b backendrun.OperationsBackend, opReq *backendrun.Op
 		opReq.ConfigDir = m.normalizePath(opReq.ConfigDir)
 	}
 
-	op, err := b.Operation(context.Background(), opReq)
+	op, err := b.Operation(m.CommandContext(), opReq)
 	if err != nil {
 		return nil, fmt.Errorf("error starting operation: %s", err)
 	}
@@ -537,7 +583,7 @@ func (m *Meta) contextOpts() (*terraform.ContextOpts, error) {
 		opts.Provisioners = m.testingOverrides.Provisioners
 	} else {
 		var providerFactories map[addrs.Provider]providers.Factory
-		providerFactories, err = m.providerFactories()
+		providerFactories, err = m.ProviderFactories()
 		opts.Providers = providerFactories
 		opts.Provisioners = m.provisionerFactories()
 	}
@@ -548,53 +594,6 @@ func (m *Meta) contextOpts() (*terraform.ContextOpts, error) {
 	}
 
 	return &opts, err
-}
-
-// defaultFlagSet creates a default flag set for commands.
-// See also command/arguments/default.go
-func (m *Meta) defaultFlagSet(n string) *flag.FlagSet {
-	f := flag.NewFlagSet(n, flag.ContinueOnError)
-	f.SetOutput(ioutil.Discard)
-
-	// Set the default Usage to empty
-	f.Usage = func() {}
-
-	return f
-}
-
-// ignoreRemoteVersionFlagSet add the ignore-remote version flag to suppress
-// the error when the configured Terraform version on the remote workspace
-// does not match the local Terraform version.
-func (m *Meta) ignoreRemoteVersionFlagSet(n string) *flag.FlagSet {
-	f := m.defaultFlagSet(n)
-
-	f.BoolVar(&m.ignoreRemoteVersion, "ignore-remote-version", false, "continue even if remote and local Terraform versions are incompatible")
-
-	return f
-}
-
-// extendedFlagSet adds custom flags that are mostly used by commands
-// that are used to run an operation like plan or apply.
-func (m *Meta) extendedFlagSet(n string) *flag.FlagSet {
-	f := m.defaultFlagSet(n)
-
-	f.BoolVar(&m.input, "input", true, "input")
-	f.Var((*arguments.FlagStringSlice)(&m.targetFlags), "target", "resource to target")
-	f.BoolVar(&m.compactWarnings, "compact-warnings", false, "use compact warnings")
-
-	if m.variableArgs.Items == nil {
-		m.variableArgs = arguments.NewFlagNameValueSlice("-var")
-	}
-	varValues := m.variableArgs.Alias("-var")
-	varFiles := m.variableArgs.Alias("-var-file")
-	f.Var(varValues, "var", "variables")
-	f.Var(varFiles, "var-file", "variable file")
-
-	// commands that bypass locking will supply their own flag on this var,
-	// but set the initial meta value to true as a failsafe.
-	m.stateLock = true
-
-	return f
 }
 
 // process will process any -no-color entries out of the arguments. This
@@ -770,10 +769,12 @@ var errInvalidWorkspaceNameEnvVar = fmt.Errorf("Invalid workspace name set using
 
 // Workspace returns the name of the currently configured workspace, corresponding
 // to the desired named state.
+//
+// Workspace names are validated via use of the `WorkspaceOverridden` method.
 func (m *Meta) Workspace() (string, error) {
-	current, overridden := m.WorkspaceOverridden()
-	if overridden && !validWorkspaceName(current) {
-		return "", errInvalidWorkspaceNameEnvVar
+	current, _, err := m.WorkspaceOverridden()
+	if err != nil {
+		return "", err
 	}
 	return current, nil
 }
@@ -781,15 +782,29 @@ func (m *Meta) Workspace() (string, error) {
 // WorkspaceOverridden returns the name of the currently configured workspace,
 // corresponding to the desired named state, as well as a bool saying whether
 // this was set via the TF_WORKSPACE environment variable.
-func (m *Meta) WorkspaceOverridden() (string, bool) {
+//
+// The method also validates the workspace name. If it's invalid, an error is
+// returned alongside an empty string. The returned boolean will still reflect
+// whether the workspace is set by ENV or not.
+func (m *Meta) WorkspaceOverridden() (string, bool, error) {
 	if envVar := os.Getenv(WorkspaceNameEnvVar); envVar != "" {
-		return envVar, true
+		if !validWorkspaceName(envVar) {
+			// Protect against invalid workspace names set via ENV.
+			return "", true, errInvalidWorkspaceNameEnvVar
+		}
+		return envVar, true, nil
 	}
 
-	envData, err := ioutil.ReadFile(filepath.Join(m.DataDir(), local.DefaultWorkspaceFile))
+	envData, err := os.ReadFile(filepath.Join(m.DataDir(), local.DefaultWorkspaceFile))
 	current := string(bytes.TrimSpace(envData))
 	if current == "" {
 		current = backend.DefaultStateName
+	}
+	if !m.bypassWorkspaceNameValidityCheck && !validWorkspaceName(current) {
+		// This check is active in every command that uses a backend.
+		// It is selectively disabled in commands that are recommended for recovering from an invalid workspace.
+		err := fmt.Errorf("Invalid workspace name: The selected workspace described in %q has an invalid name. This suggests that the file contents were edited by something other than Terraform. To select a different, valid workspace name use commands `terraform workspace select` or `terraform workspace select -or-create`.", filepath.Join(m.DataDir(), local.DefaultWorkspaceFile))
+		return "", false, err
 	}
 
 	if err != nil && !os.IsNotExist(err) {
@@ -797,7 +812,7 @@ func (m *Meta) WorkspaceOverridden() (string, bool) {
 		log.Printf("[ERROR] failed to read current workspace: %s", err)
 	}
 
-	return current, false
+	return current, false, nil
 }
 
 // SetWorkspace saves the given name as the current workspace in the local
@@ -813,12 +828,6 @@ func (m *Meta) SetWorkspace(name string) error {
 		return err
 	}
 	return nil
-}
-
-// isAutoVarFile determines if the file ends with .auto.tfvars or .auto.tfvars.json
-func isAutoVarFile(path string) bool {
-	return strings.HasSuffix(path, ".auto.tfvars") ||
-		strings.HasSuffix(path, ".auto.tfvars.json")
 }
 
 // FIXME: as an interim refactoring step, we apply the contents of the state
@@ -837,19 +846,20 @@ func (m *Meta) applyStateArguments(args *arguments.State) {
 func (m *Meta) checkRequiredVersion() tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 
-	loader, err := m.initConfigLoader()
-	if err != nil {
-		diags = diags.Append(err)
-		return diags
-	}
-
+	// Cannot use m.WorkingDir.RootModuleDir() here because
+	// of path normalization that happens in loadConfig.
 	pwd, err := os.Getwd()
 	if err != nil {
 		diags = diags.Append(fmt.Errorf("Error getting pwd: %s", err))
 		return diags
 	}
 
-	config, configDiags := loader.LoadConfig(pwd)
+	diags = diags.Append(m.resolveConstVariables(pwd, arguments.ViewHuman))
+	if diags.HasErrors() {
+		return diags
+	}
+
+	config, configDiags := m.loadConfig(pwd)
 	if configDiags.HasErrors() {
 		diags = diags.Append(configDiags)
 		return diags
@@ -872,16 +882,18 @@ func (m *Meta) checkRequiredVersion() tfdiags.Diagnostics {
 func (c *Meta) MaybeGetSchemas(state *states.State, config *configs.Config) (*terraform.Schemas, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
+	// Cannot use m.WorkingDir.RootModuleDir() here because
+	// of path normalization that happens in loadConfig.
 	path, err := os.Getwd()
 	if err != nil {
-		diags.Append(tfdiags.SimpleWarning(failedToLoadSchemasMessage))
+		diags = diags.Append(tfdiags.SimpleWarning(failedToLoadSchemasMessage))
 		return nil, diags
 	}
 
 	if config == nil {
 		config, diags = c.loadConfig(path)
 		if diags.HasErrors() {
-			diags.Append(tfdiags.SimpleWarning(failedToLoadSchemasMessage))
+			diags = diags.Append(tfdiags.SimpleWarning(failedToLoadSchemasMessage))
 			return nil, diags
 		}
 	}

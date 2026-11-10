@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terminal
@@ -34,6 +34,8 @@ import (
 // any setup errors by logging a message to the given testing.T object and
 // then failing the test, preventing any later code from running.
 func StreamsForTesting(t *testing.T) (streams *Streams, close func(*testing.T) *TestOutput) {
+	t.Helper()
+
 	stdinR, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatalf("failed to open /dev/null to represent stdin: %s", err)
@@ -99,6 +101,8 @@ func StreamsForTesting(t *testing.T) (streams *Streams, close func(*testing.T) *
 	go consume(stderrR, true)
 
 	close = func(t *testing.T) *TestOutput {
+		t.Helper()
+
 		err := stdinR.Close()
 		if err != nil {
 			t.Errorf("failed to close stdin handle: %s", err)
@@ -158,7 +162,12 @@ type testOutputPart struct {
 }
 
 // All returns the output written to both the Stdout and Stderr streams,
-// interleaved together in the order of writing in a single string.
+// interleaved together in a single string.
+//
+// It's not possible to make non-flakey/reliable assertions about the order of writes
+// between the Stdout and Stderr with this method; the returned string reflects the order
+// that data was captured from the two streams but not necessarily the order in which it
+// was written. In contrast, ordering within a single stream is preserved.
 func (o TestOutput) All() string {
 	buf := &strings.Builder{}
 	for _, part := range o.parts {

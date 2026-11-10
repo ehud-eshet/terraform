@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package rpcapi
@@ -84,7 +84,7 @@ func serverHandshake(s *grpc.Server, opts *serviceOpts) func(context.Context, *s
 		// doing real work. In future the details of what we register here
 		// might vary based on the negotiated capabilities.
 		dependenciesStub.ActivateRPCServer(newDependenciesServer(handles, services))
-		stacksStub.ActivateRPCServer(newStacksServer(stopper, handles, opts))
+		stacksStub.ActivateRPCServer(newStacksServer(stopper, handles, services, opts))
 		packagesStub.ActivateRPCServer(newPackagesServer(services))
 
 		// If the client requested any extra capabililties that we're going

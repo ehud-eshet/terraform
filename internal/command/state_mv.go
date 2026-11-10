@@ -1,13 +1,12 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
 
 import (
 	"fmt"
+	"sort"
 	"strings"
-
-	"github.com/hashicorp/cli"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/backend/backendrun"
@@ -19,33 +18,41 @@ import (
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
-// StateMvCommand is a Command implementation that shows a single resource.
+// StateMvCommand is a Command implementation that changes bindings
+// in Terraform state so that existing remote objects bind to new resource instances.
 type StateMvCommand struct {
 	StateMeta
 }
 
 func (c *StateMvCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	// We create two metas to track the two states
-	var backupPathOut, statePathOut string
+	var diags tfdiags.Diagnostics
 
-	var dryRun bool
-	cmdFlags := c.Meta.ignoreRemoteVersionFlagSet("state mv")
-	cmdFlags.BoolVar(&dryRun, "dry-run", false, "dry run")
-	cmdFlags.StringVar(&c.backupPath, "backup", "-", "backup")
-	cmdFlags.StringVar(&backupPathOut, "backup-out", "-", "backup")
-	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock states")
-	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
-	cmdFlags.StringVar(&c.statePath, "state", "", "path")
-	cmdFlags.StringVar(&statePathOut, "state-out", "", "path")
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
+	parsedArgs, parseDiags := arguments.ParseStateMv(c.Meta.process(args))
+	if parseDiags.HasErrors() {
+		c.showDiagnostics(parseDiags)
 		return 1
 	}
-	args = cmdFlags.Args()
-	if len(args) != 2 {
-		c.Ui.Error("Exactly two arguments expected.\n")
-		return cli.RunResultHelp
+
+	c.backupPath = parsedArgs.BackupPath
+	c.Meta.stateLock = parsedArgs.StateLock
+	c.Meta.stateLockTimeout = parsedArgs.StateLockTimeout
+	c.statePath = parsedArgs.StatePath
+	c.Meta.ignoreRemoteVersion = parsedArgs.IgnoreRemoteVersion
+
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(err)
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	var varDiags tfdiags.Diagnostics
+	c.VariableValues, varDiags = parsedArgs.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	if varDiags.HasErrors() {
+		c.showDiagnostics(varDiags)
+		return 1
 	}
 
 	if diags := c.Meta.checkRequiredVersion(); diags != nil {
@@ -57,7 +64,7 @@ func (c *StateMvCommand) Run(args []string) int {
 	// and the state option is not set, make sure
 	// the backend is local
 	backupOptionSetWithoutStateOption := c.backupPath != "-" && c.statePath == ""
-	backupOutOptionSetWithoutStateOption := backupPathOut != "-" && c.statePath == ""
+	backupOutOptionSetWithoutStateOption := parsedArgs.BackupOutPath != "-" && c.statePath == ""
 
 	var setLegacyLocalBackendOptions []string
 	if backupOptionSetWithoutStateOption {
@@ -91,9 +98,11 @@ func (c *StateMvCommand) Run(args []string) int {
 	}
 
 	// Read the from state
-	stateFromMgr, err := c.State()
+	view := arguments.ViewHuman
+	stateFromMgr, err := c.State(view)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateLoadingState, err))
+		diags = diags.Append(fmt.Errorf(errStateLoadingState, err))
+		c.showDiagnostics(diags)
 		return 1
 	}
 
@@ -111,13 +120,19 @@ func (c *StateMvCommand) Run(args []string) int {
 	}
 
 	if err := stateFromMgr.RefreshState(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to refresh source state: %s", err))
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to refresh the state",
+			fmt.Sprintf("Error refreshing the source state: %s", err),
+		))
+		c.showDiagnostics(diags)
 		return 1
 	}
 
 	stateFrom := stateFromMgr.State()
 	if stateFrom == nil {
-		c.Ui.Error(errStateNotFound)
+		diags = diags.Append(errStateNotFound)
+		c.showDiagnostics(diags)
 		return 1
 	}
 
@@ -125,13 +140,14 @@ func (c *StateMvCommand) Run(args []string) int {
 	stateToMgr := stateFromMgr
 	stateTo := stateFrom
 
-	if statePathOut != "" {
-		c.statePath = statePathOut
-		c.backupPath = backupPathOut
+	if parsedArgs.StateOutPath != "" {
+		c.statePath = parsedArgs.StateOutPath
+		c.backupPath = parsedArgs.BackupOutPath
 
-		stateToMgr, err = c.State()
+		stateToMgr, err = c.State(view)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf(errStateLoadingState, err))
+			diags = diags.Append(fmt.Errorf(errStateLoadingState, err))
+			c.showDiagnostics(diags)
 			return 1
 		}
 
@@ -149,7 +165,12 @@ func (c *StateMvCommand) Run(args []string) int {
 		}
 
 		if err := stateToMgr.RefreshState(); err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to refresh destination state: %s", err))
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Failed to refresh the state",
+				fmt.Sprintf("Error refreshing the destination state: %s", err),
+			))
+			c.showDiagnostics(diags)
 			return 1
 		}
 
@@ -159,25 +180,24 @@ func (c *StateMvCommand) Run(args []string) int {
 		}
 	}
 
-	var diags tfdiags.Diagnostics
-	sourceAddr, moreDiags := c.lookupSingleStateObjectAddr(stateFrom, args[0])
+	sourceAddr, moreDiags := c.lookupSingleStateObjectAddr(stateFrom, parsedArgs.SourceAddr)
 	diags = diags.Append(moreDiags)
-	destAddr, moreDiags := c.lookupSingleStateObjectAddr(stateFrom, args[1])
+	destAddr, moreDiags := c.lookupSingleStateObjectAddr(stateFrom, parsedArgs.DestAddr)
 	diags = diags.Append(moreDiags)
 	if diags.HasErrors() {
 		c.showDiagnostics(diags)
 		return 1
 	}
 
-	prefix := "Move"
-	if dryRun {
-		prefix = "Would move"
-	}
-
 	const msgInvalidSource = "Invalid source address"
 	const msgInvalidTarget = "Invalid target address"
 
-	var moved int
+	type move struct {
+		to   fmt.Stringer
+		from fmt.Stringer
+	}
+	moves := []move{}
+
 	ssFrom := stateFrom.SyncWrapper()
 	sourceAddrs := c.sourceObjectAddrs(stateFrom, sourceAddr)
 	if len(sourceAddrs) == 0 {
@@ -212,7 +232,12 @@ func (c *StateMvCommand) Run(args []string) int {
 			}
 
 			if stateTo.Module(addrTo) != nil {
-				c.Ui.Error(fmt.Sprintf(errStateMv, "destination module already exists"))
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					msgInvalidTarget,
+					fmt.Sprintf("Cannot move to %s: the destination module already exists at that address in the current state.", addrTo),
+				))
+				c.showDiagnostics(diags)
 				return 1
 			}
 
@@ -227,9 +252,11 @@ func (c *StateMvCommand) Run(args []string) int {
 				return 1
 			}
 
-			moved++
-			c.Ui.Output(fmt.Sprintf("%s %q to %q", prefix, addrFrom.String(), addrTo.String()))
-			if !dryRun {
+			moves = append(moves, move{
+				to:   addrTo,
+				from: addrFrom,
+			})
+			if !parsedArgs.DryRun {
 				ssFrom.RemoveModule(addrFrom)
 
 				// Update the address before adding it to the state.
@@ -272,9 +299,11 @@ func (c *StateMvCommand) Run(args []string) int {
 				return 1
 			}
 
-			moved++
-			c.Ui.Output(fmt.Sprintf("%s %q to %q", prefix, addrFrom.String(), addrTo.String()))
-			if !dryRun {
+			moves = append(moves, move{
+				to:   addrTo,
+				from: addrFrom,
+			})
+			if !parsedArgs.DryRun {
 				ssFrom.RemoveResource(addrFrom)
 
 				// Update the address before adding it to the state.
@@ -326,9 +355,11 @@ func (c *StateMvCommand) Run(args []string) int {
 				return 1
 			}
 
-			moved++
-			c.Ui.Output(fmt.Sprintf("%s %q to %q", prefix, addrFrom.String(), args[1]))
-			if !dryRun {
+			moves = append(moves, move{
+				to:   addrTo,
+				from: addrFrom,
+			})
+			if !parsedArgs.DryRun {
 				fromResourceAddr := addrFrom.ContainingResource()
 				fromResource := ssFrom.Resource(fromResourceAddr)
 				fromProviderAddr := fromResource.ProviderConfig
@@ -361,7 +392,20 @@ func (c *StateMvCommand) Run(args []string) int {
 		}
 
 		// Look for any dependencies that may be effected and
-		// remove them to ensure they are recreated in full.
+		// remove them to ensure they are recreated in full. Dependencies are
+		// recorded as configuration addresses, so we compare them with the
+		// configuration object containing whatever was moved.
+		var configFrom addrs.Targetable
+		switch addr := rawAddrFrom.(type) {
+		case addrs.ModuleInstance:
+			configFrom = addr.Module()
+		case addrs.AbsResource:
+			configFrom = addr.Config()
+		case addrs.AbsResourceInstance:
+			configFrom = addr.ConfigResource()
+		default:
+			configFrom = rawAddrFrom
+		}
 		for _, mod := range stateTo.Modules {
 			for _, res := range mod.Resources {
 				for _, ins := range res.Instances {
@@ -373,7 +417,7 @@ func (c *StateMvCommand) Run(args []string) int {
 						// check both directions here, since we may be moving
 						// an instance which is in a resource, or a module
 						// which can contain a resource.
-						if dep.TargetContains(rawAddrFrom) || rawAddrFrom.TargetContains(dep) {
+						if dep.Contains(configFrom) || configFrom.Contains(dep) {
 							ins.Current.Dependencies = nil
 							break
 						}
@@ -383,14 +427,24 @@ func (c *StateMvCommand) Run(args []string) int {
 		}
 	}
 
-	if dryRun {
-		if moved == 0 {
-			c.Ui.Output("Would have moved nothing.")
-		}
-		return 0 // This is as far as we go in dry-run mode
+	prefix := "Move"
+	if parsedArgs.DryRun {
+		prefix = "Would move"
 	}
 
-	b, backendDiags := c.Backend(nil)
+	if parsedArgs.DryRun {
+		if len(moves) == 0 {
+			c.Ui.Output("Would have moved nothing.")
+		} else {
+			for _, mv := range moves {
+				c.Ui.Output(fmt.Sprintf("%s %q to %q", prefix, mv.from.String(), mv.to.String()))
+			}
+			return 0 // This is as far as we go in dry-run mode
+		}
+	}
+
+	// Load the backend
+	b, backendDiags := c.backend(".", view)
 	diags = diags.Append(backendDiags)
 	if backendDiags.HasErrors() {
 		c.showDiagnostics(diags)
@@ -407,32 +461,39 @@ func (c *StateMvCommand) Run(args []string) int {
 
 	// Write the new state
 	if err := stateToMgr.WriteState(stateTo); err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateRmPersist, err))
+		diags = diags.Append(stateMvPersistErrDiag(err))
+		c.showDiagnostics(diags)
 		return 1
 	}
 	if err := stateToMgr.PersistState(schemas); err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateRmPersist, err))
+		diags = diags.Append(stateMvPersistErrDiag(err))
+		c.showDiagnostics(diags)
 		return 1
 	}
 
 	// Write the old state if it is different
 	if stateTo != stateFrom {
 		if err := stateFromMgr.WriteState(stateFrom); err != nil {
-			c.Ui.Error(fmt.Sprintf(errStateRmPersist, err))
+			diags = diags.Append(stateMvPersistSourceStateErrDiag(err))
+			c.showDiagnostics(diags)
 			return 1
 		}
 		if err := stateFromMgr.PersistState(schemas); err != nil {
-			c.Ui.Error(fmt.Sprintf(errStateRmPersist, err))
+			diags = diags.Append(stateMvPersistSourceStateErrDiag(err))
+			c.showDiagnostics(diags)
 			return 1
 		}
 	}
 
 	c.showDiagnostics(diags)
 
-	if moved == 0 {
+	if len(moves) == 0 {
 		c.Ui.Output("No matching objects found.")
 	} else {
-		c.Ui.Output(fmt.Sprintf("Successfully moved %d object(s).", moved))
+		for _, mv := range moves {
+			c.Ui.Output(fmt.Sprintf("%s %q to %q", prefix, mv.from.String(), mv.to.String()))
+		}
+		c.Ui.Output(fmt.Sprintf("Successfully moved %d object(s).", len(moves)))
 	}
 	return 0
 }
@@ -476,6 +537,11 @@ func (c *StateMvCommand) sourceObjectAddrs(state *states.State, matched addrs.Ta
 	default:
 		ret = append(ret, matched)
 	}
+
+	// Sort, to counter-act iterating over the state.Modules map above.
+	sort.Slice(ret, func(i, j int) bool {
+		return ret[i].String() < ret[j].String()
+	})
 
 	return ret
 }
@@ -551,6 +617,15 @@ Options:
   -ignore-remote-version  A rare option used for the remote backend only. See
                           the remote backend documentation for more information.
 
+  -var 'foo=bar'          Set a value for one of the input variables in the root
+                          module of the configuration. Use this option more than
+                          once to set more than one variable.
+
+  -var-file=filename      Load variable values from the given file, in addition
+                          to the default files terraform.tfvars and *.auto.tfvars.
+                          Use this option more than once to include more than one
+                          variables file.
+
   -state, state-out, and -backup are legacy options supported for the local
   backend only. For more information, see the local backend's documentation.
 
@@ -562,7 +637,26 @@ func (c *StateMvCommand) Synopsis() string {
 	return "Move an item in the state"
 }
 
-const errStateMv = `Error moving state: %s
+func stateMvPersistErrDiag(err error) tfdiags.Diagnostic {
+	return tfdiags.Sourceless(
+		tfdiags.Error,
+		"Failed to save the state",
+		fmt.Sprintf(`Terraform encountered an error when saving state: %s
 
-Please ensure your addresses and state paths are valid. No
-state was persisted. Your existing states are untouched.`
+The state was not saved. No items were moved within the persisted state.
+Please resolve the issue above and try again.`, err),
+	)
+}
+
+// This is only relevant if the -state-out and -state options are both used.
+func stateMvPersistSourceStateErrDiag(err error) tfdiags.Diagnostic {
+	return tfdiags.Sourceless(
+		tfdiags.Error,
+		"Failed to save the state",
+		fmt.Sprintf(`Terraform encountered an error when saving state: %s
+
+The destination state provided using -state-out was updated, but an error occurred when performing the
+paired update of the source state provided using -state. The source state may still contain any items
+that were intended to be moved. Please resolve the issue above and try again.`, err),
+	)
+}

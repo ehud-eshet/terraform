@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package getproviders
@@ -71,6 +71,14 @@ type registryClient struct {
 }
 
 func newRegistryClient(baseURL *url.URL, creds svcauth.HostCredentials) *registryClient {
+	return &registryClient{
+		baseURL:    baseURL,
+		creds:      creds,
+		httpClient: newRegistryHTTPClient(),
+	}
+}
+
+func newRegistryHTTPClient() *retryablehttp.Client {
 	httpClient := httpclient.New()
 	httpClient.Timeout = requestTimeout
 
@@ -82,11 +90,7 @@ func newRegistryClient(baseURL *url.URL, creds svcauth.HostCredentials) *registr
 
 	retryableClient.Logger = log.New(logging.LogOutput(), "", log.Flags())
 
-	return &registryClient{
-		baseURL:    baseURL,
-		creds:      creds,
-		httpClient: retryableClient,
-	}
+	return retryableClient
 }
 
 // ProviderVersions returns the raw version and protocol strings produced by the
@@ -376,10 +380,8 @@ func (c *registryClient) findClosestProtocolCompatibleVersion(ctx context.Contex
 	for versionStr := range available {
 		v, err := ParseVersion(versionStr)
 		if err != nil {
-			return UnspecifiedVersion, ErrQueryFailed{
-				Provider: provider,
-				Wrapped:  fmt.Errorf("registry response includes invalid version string %q: %s", versionStr, err),
-			}
+			log.Printf("[WARN] registry response includes invalid version string %q. skipping: %s", versionStr, err)
+			continue
 		}
 		versionList = append(versionList, v)
 	}

@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -58,5 +58,6 @@ func getProvider(ctx EvalContext, addr addrs.AbsProviderConfig) (providers.Inter
 	if err != nil {
 		return nil, providers.ProviderSchema{}, fmt.Errorf("failed to read schema for provider %s: %w", addr, err)
 	}
+
 	return provider, schema, nil
 }

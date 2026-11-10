@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package states
@@ -10,7 +10,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/lang/marks"
+	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -23,6 +25,27 @@ func TestResourceInstanceObject_encode(t *testing.T) {
 		"sensitive_a": cty.StringVal("secret").Mark(marks.Sensitive),
 		"sensitive_b": cty.StringVal("secret").Mark(marks.Sensitive),
 	})
+	schema := providers.Schema{
+		Body: &configschema.Block{
+			Attributes: map[string]*configschema.Attribute{
+				"foo": {
+					Type: cty.Bool,
+				},
+				"obj": {
+					Type: cty.Object(map[string]cty.Type{
+						"sensitive": cty.String,
+					}),
+				},
+				"sensitive_a": {
+					Type: cty.String,
+				},
+				"sensitive_b": {
+					Type: cty.String,
+				},
+			},
+		},
+		Version: 0,
+	}
 	// The in-memory order of resource dependencies is random, since they're an
 	// unordered set.
 	depsOne := []addrs.ConfigResource{
@@ -38,22 +61,22 @@ func TestResourceInstanceObject_encode(t *testing.T) {
 
 	// multiple instances may have been assigned the same deps slice
 	objs := []*ResourceInstanceObject{
-		&ResourceInstanceObject{
+		{
 			Value:        value,
 			Status:       ObjectPlanned,
 			Dependencies: depsOne,
 		},
-		&ResourceInstanceObject{
+		{
 			Value:        value,
 			Status:       ObjectPlanned,
 			Dependencies: depsTwo,
 		},
-		&ResourceInstanceObject{
+		{
 			Value:        value,
 			Status:       ObjectPlanned,
 			Dependencies: depsOne,
 		},
-		&ResourceInstanceObject{
+		{
 			Value:        value,
 			Status:       ObjectPlanned,
 			Dependencies: depsOne,
@@ -68,18 +91,15 @@ func TestResourceInstanceObject_encode(t *testing.T) {
 	var mu sync.Mutex
 
 	for _, obj := range objs {
-		obj := obj
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rios, err := obj.Encode(value.Type(), 0)
+		wg.Go(func() {
+			rios, err := obj.Encode(schema)
 			if err != nil {
 				t.Errorf("unexpected error: %s", err)
 			}
 			mu.Lock()
 			encoded = append(encoded, rios)
 			mu.Unlock()
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -108,12 +128,22 @@ func TestResourceInstanceObject_encodeInvalidMarks(t *testing.T) {
 		// value in the state.
 		"foo": cty.True.Mark("unsupported"),
 	})
+	schema := providers.Schema{
+		Body: &configschema.Block{
+			Attributes: map[string]*configschema.Attribute{
+				"foo": {
+					Type: cty.Bool,
+				},
+			},
+		},
+		Version: 0,
+	}
 
 	obj := &ResourceInstanceObject{
 		Value:  value,
 		Status: ObjectReady,
 	}
-	_, err := obj.Encode(value.Type(), 0)
+	_, err := obj.Encode(schema)
 	if err == nil {
 		t.Fatalf("unexpected success; want error")
 	}

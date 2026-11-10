@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -60,12 +60,12 @@ func cbdTestSteps(steps []GraphTransformer) []GraphTransformer {
 
 // remove extra nodes for easier test comparisons
 func filterInstances(g *Graph) *Graph {
-	for _, v := range g.Vertices() {
+	for v := range g.VerticesSeq() {
 		if _, ok := v.(GraphNodeResourceInstance); !ok {
 			// connect around the node to remove it without breaking deps
-			for _, down := range g.DownEdges(v) {
-				for _, up := range g.UpEdges(v) {
-					g.Connect(dag.BasicEdge(up, down))
+			for to := range g.EdgesFrom(v).All() {
+				for from := range g.EdgesTo(v).All() {
+					g.Connect(from, to)
 				}
 			}
 
@@ -367,5 +367,47 @@ test_object.B\[1\]
 
 	if !expected.MatchString(actual) {
 		t.Fatalf("wrong result\n\ngot:\n%s\n\nwant:\n%s", actual, expected)
+	}
+}
+
+func TestCBDEdgeTransformer_creatorWaitsForDifferentCBDDestroy(t *testing.T) {
+	aDestroy := &NodeDestroyResourceInstance{
+		NodeAbstractResourceInstance: NewNodeAbstractResourceInstance(mustResourceInstanceAddr("test_object.a")),
+	}
+	bDestroy := &NodeDestroyResourceInstance{
+		NodeAbstractResourceInstance: NewNodeAbstractResourceInstance(mustResourceInstanceAddr("test_object.b")),
+	}
+	cDestroy := &NodeDestroyResourceInstance{
+		NodeAbstractResourceInstance: NewNodeAbstractResourceInstance(mustResourceInstanceAddr("test_object.c")),
+	}
+	cCreate := &NodeApplyableResourceInstance{
+		NodeAbstractResourceInstance: NewNodeAbstractResourceInstance(mustResourceInstanceAddr("test_object.c")),
+	}
+	aDestroy.ForceCreateBeforeDestroy()
+	bDestroy.ForceCreateBeforeDestroy()
+
+	g := &Graph{}
+	for _, v := range []dag.Vertex{aDestroy, bDestroy, cDestroy, cCreate} {
+		g.Add(v)
+	}
+	g.Connect(cCreate, cDestroy)
+	g.Connect(cDestroy, aDestroy)
+	g.Connect(cCreate, aDestroy)
+	g.Connect(cCreate, bDestroy)
+
+	if err := (&CBDEdgeTransformer{}).Transform(g); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !g.EdgesFrom(cCreate).Contains(cDestroy) {
+		t.Fatal("the delete-before-create replacement must keep its own destroy edge")
+	}
+	if !g.EdgesFrom(cCreate).Contains(aDestroy) {
+		t.Fatal("c already waits for a's destroy and must keep that edge")
+	}
+	if !g.EdgesFrom(bDestroy).Contains(cCreate) {
+		t.Fatal("b must wait for c's creator, even though c already waits for a's destroy")
 	}
 }

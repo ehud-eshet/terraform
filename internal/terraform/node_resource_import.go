@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -36,23 +36,13 @@ func (n *graphNodeImportState) Name() string {
 }
 
 // GraphNodeProviderConsumer
-func (n *graphNodeImportState) ProvidedBy() (addrs.ProviderConfig, bool) {
+func (n *graphNodeImportState) Provider() ProviderRef {
 	// We assume that n.ProviderAddr has been properly populated here.
 	// It's the responsibility of the code creating a graphNodeImportState
 	// to populate this, possibly by calling DefaultProviderConfig() on the
 	// resource address to infer an implied provider from the resource type
 	// name.
-	return n.ProviderAddr, false
-}
-
-// GraphNodeProviderConsumer
-func (n *graphNodeImportState) Provider() addrs.Provider {
-	// We assume that n.ProviderAddr has been properly populated here.
-	// It's the responsibility of the code creating a graphNodeImportState
-	// to populate this, possibly by calling DefaultProviderConfig() on the
-	// resource address to infer an implied provider from the resource type
-	// name.
-	return n.ProviderAddr.Provider
+	return ProviderRef{Addr: n.ProviderAddr}
 }
 
 // GraphNodeProviderConsumer
@@ -81,8 +71,8 @@ func (n *graphNodeImportState) Execute(ctx EvalContext, op walkOperation) (diags
 		return diags
 	}
 
-	schema, _ := providerSchema.SchemaForResourceType(n.Addr.Resource.Resource.Mode, n.Addr.Resource.Resource.Type)
-	if schema == nil {
+	schema := providerSchema.SchemaForResourceType(n.Addr.Resource.Resource.Mode, n.Addr.Resource.Resource.Type)
+	if schema.Body == nil {
 		// Should be caught during validation, so we don't bother with a pretty error here
 		diags = diags.Append(fmt.Errorf("provider does not support resource type %q", n.Addr.Resource.Resource.Type))
 		return diags
@@ -125,7 +115,7 @@ func (n *graphNodeImportState) Execute(ctx EvalContext, op walkOperation) (diags
 				)
 			},
 			imported.State,
-			schema,
+			schema.Body,
 		)
 		diags = diags.Append(writeOnlyDiags)
 	}
@@ -214,8 +204,6 @@ func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.D
 		})
 	}
 
-	addRootNodeToGraph(g)
-
 	// Done!
 	return g, diags
 }
@@ -250,7 +238,7 @@ func (n *graphNodeImportStateSub) Execute(ctx EvalContext, op walkOperation) (di
 		return diags
 	}
 
-	state := n.State.AsInstanceObject()
+	state := states.NewResourceInstanceObjectFromIR(n.State)
 
 	// Refresh
 	riNode := &NodeAbstractResourceInstance{

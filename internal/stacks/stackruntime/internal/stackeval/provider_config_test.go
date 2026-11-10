@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package stackeval
@@ -12,8 +12,11 @@ import (
 	"github.com/zclconf/go-cty-debug/ctydebug"
 	"github.com/zclconf/go-cty/cty"
 
+	"github.com/apparentlymart/go-versions/versions/constraints"
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
+	"github.com/hashicorp/terraform/internal/depsfile"
+	"github.com/hashicorp/terraform/internal/getproviders/providerreqs"
 	"github.com/hashicorp/terraform/internal/providers"
 	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
@@ -50,15 +53,15 @@ func TestProviderConfig_CheckProviderArgs_EmptyConfig(t *testing.T) {
 	}
 	getProviderConfig := func(ctx context.Context, t *testing.T, main *Main) *ProviderConfig {
 		t.Helper()
-		mainStack := main.MainStack(ctx)
-		provider := mainStack.Provider(ctx, stackaddrs.ProviderConfig{
+		mainStack := main.MainStack()
+		provider := mainStack.Provider(stackaddrs.ProviderConfig{
 			Provider: providerTypeAddr,
 			Name:     "bar",
 		})
 		if provider == nil {
 			t.Fatal("no provider.foo.bar is available")
 		}
-		return provider.Config(ctx)
+		return provider.config
 	}
 
 	subtestInPromisingTask(t, "valid", func(ctx context.Context, t *testing.T) {
@@ -132,15 +135,15 @@ func TestProviderConfig_CheckProviderArgs(t *testing.T) {
 	}
 	getProviderConfig := func(ctx context.Context, t *testing.T, main *Main) *ProviderConfig {
 		t.Helper()
-		mainStack := main.MainStack(ctx)
-		provider := mainStack.Provider(ctx, stackaddrs.ProviderConfig{
+		mainStack := main.MainStack()
+		provider := mainStack.Provider(stackaddrs.ProviderConfig{
 			Provider: providerTypeAddr,
 			Name:     "bar",
 		})
 		if provider == nil {
 			t.Fatal("no provider.foo.bar is available")
 		}
-		return provider.Config(ctx)
+		return provider.config
 	}
 
 	subtestInPromisingTask(t, "valid", func(ctx context.Context, t *testing.T) {
@@ -217,4 +220,80 @@ func TestProviderConfig_CheckProviderArgs(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestCheckProviderInLockfile(t *testing.T) {
+	providerAddr := addrs.NewDefaultProvider("testing")
+	providerType := newProviderType(nil, providerAddr)
+
+	mustConstraints := func(s string) constraints.IntersectionSpec {
+		spec, err := constraints.ParseRubyStyleMulti(s)
+		if err != nil {
+			t.Fatalf("invalid constraint %q: %s", s, err)
+		}
+		return spec
+	}
+
+	// A lock file that records version 1.2.0 for the testing provider.
+	lockedLocks := depsfile.NewLocks()
+	lockedLocks.SetProvider(
+		providerAddr,
+		providerreqs.MustParseVersion("1.2.0"),
+		providerreqs.MustParseVersionConstraints("~> 1.2.0"),
+		providerreqs.PreferredHashes([]providerreqs.Hash{}),
+	)
+
+	tests := map[string]struct {
+		locks       *depsfile.Locks
+		constraints constraints.IntersectionSpec
+		wantSummary string
+	}{
+		"present and satisfies constraints": {
+			locks:       lockedLocks,
+			constraints: mustConstraints("~> 1.2"),
+			wantSummary: "",
+		},
+		"present with no constraints": {
+			locks:       lockedLocks,
+			constraints: nil,
+			wantSummary: "",
+		},
+		"present but constraints no longer allow locked version": {
+			locks:       lockedLocks,
+			constraints: mustConstraints(">= 2.0.0"),
+			wantSummary: "Provider version doesn't match the lockfile",
+		},
+		"missing from lockfile": {
+			locks:       depsfile.NewLocks(),
+			constraints: mustConstraints("~> 1.2"),
+			wantSummary: "Provider missing from lockfile",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			diags := CheckProviderInLockfile(*tc.locks, providerType, tc.constraints, nil)
+
+			if tc.wantSummary == "" {
+				if diags.HasErrors() {
+					t.Fatalf("unexpected diagnostics:\n%s", diags.Err())
+				}
+				return
+			}
+
+			if !diags.HasErrors() {
+				t.Fatalf("expected error %q, got none", tc.wantSummary)
+			}
+			found := false
+			for _, diag := range diags {
+				if diag.Description().Summary == tc.wantSummary {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected diagnostic %q, got:\n%s", tc.wantSummary, diags.Err())
+			}
+		})
+	}
 }

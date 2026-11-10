@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package azure
@@ -220,6 +220,39 @@ func TestAccBackendAzureADAuthBasic(t *testing.T) {
 		"client_secret":        m.clientSecret,
 		"use_azuread_auth":     true,
 		"environment":          m.env.Name,
+	})).(*Backend)
+
+	backend.TestBackendStates(t, b)
+}
+
+func TestAccBackendAzureADAuthBasicWithBlobEndpointLookup(t *testing.T) {
+	t.Parallel()
+
+	testAccAzureBackend(t)
+
+	ctx := newCtx()
+	m := BuildTestMeta(t, ctx)
+
+	err := m.buildTestResources(ctx)
+	if err != nil {
+		m.destroyTestResources(ctx)
+		t.Fatalf("Error creating Test Resources: %q", err)
+	}
+	defer m.destroyTestResources(ctx)
+
+	clearARMEnv()
+	b := backend.TestBackendConfig(t, New(), backend.TestWrapConfig(map[string]interface{}{
+		"subscription_id":      m.subscriptionId,
+		"resource_group_name":  m.names.resourceGroup,
+		"storage_account_name": m.names.storageAccountName,
+		"container_name":       m.names.storageContainerName,
+		"key":                  m.names.storageKeyName,
+		"tenant_id":            m.tenantId,
+		"client_id":            m.clientId,
+		"client_secret":        m.clientSecret,
+		"use_azuread_auth":     true,
+		"environment":          m.env.Name,
+		"lookup_blob_endpoint": true,
 	})).(*Backend)
 
 	backend.TestBackendStates(t, b)

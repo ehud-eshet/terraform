@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package remote
@@ -24,12 +24,12 @@ import (
 	"github.com/hashicorp/terraform/internal/command/clistate"
 	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/depsfile"
-	"github.com/hashicorp/terraform/internal/initwd"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/planfile"
 	"github.com/hashicorp/terraform/internal/states/statemgr"
 	"github.com/hashicorp/terraform/internal/terminal"
 	"github.com/hashicorp/terraform/internal/terraform"
+	tftesting "github.com/hashicorp/terraform/internal/terraform/testing"
 )
 
 func testOperationPlan(t *testing.T, configDir string) (*backendrun.Operation, func(), func(*testing.T) *terminal.TestOutput) {
@@ -41,7 +41,7 @@ func testOperationPlan(t *testing.T, configDir string) (*backendrun.Operation, f
 func testOperationPlanWithTimeout(t *testing.T, configDir string, timeout time.Duration) (*backendrun.Operation, func(), func(*testing.T) *terminal.TestOutput) {
 	t.Helper()
 
-	_, configLoader, configCleanup := initwd.MustLoadConfigForTests(t, configDir, "tests")
+	_, configLoader, configCleanup := tftesting.MustLoadConfigForTests(t, configDir, "tests")
 
 	streams, done := terminal.StreamsForTesting(t)
 	view := views.NewView(streams)
@@ -462,9 +462,9 @@ func TestRemote_planWithTarget(t *testing.T) {
 	defer configCleanup()
 	defer done(t)
 
-	addr, _ := addrs.ParseAbsResourceStr("null_resource.foo")
+	addr, _ := addrs.ParseTargetStr("null_resource.foo")
 
-	op.Targets = []addrs.Targetable{addr}
+	op.Targets = []addrs.TargetPattern{addr}
 	op.Workspace = backend.DefaultStateName
 
 	run, err := b.Operation(context.Background(), op)
@@ -511,9 +511,9 @@ func TestRemote_planWithTargetIncompatibleAPIVersion(t *testing.T) {
 	// API versions prior to 2.3.
 	b.client.SetFakeRemoteAPIVersion("")
 
-	addr, _ := addrs.ParseAbsResourceStr("null_resource.foo")
+	addr, _ := addrs.ParseTargetStr("null_resource.foo")
 
-	op.Targets = []addrs.Targetable{addr}
+	op.Targets = []addrs.TargetPattern{addr}
 	op.Workspace = backend.DefaultStateName
 
 	run, err := b.Operation(context.Background(), op)

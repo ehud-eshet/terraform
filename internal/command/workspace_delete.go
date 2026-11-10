@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -6,9 +6,8 @@ package command
 import (
 	"fmt"
 	"strings"
-	"time"
 
-	"github.com/hashicorp/cli"
+	"github.com/hashicorp/terraform/internal/backend"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/clistate"
 	"github.com/hashicorp/terraform/internal/command/views"
@@ -22,64 +21,48 @@ type WorkspaceDeleteCommand struct {
 	LegacyName bool
 }
 
-func (c *WorkspaceDeleteCommand) Run(args []string) int {
-	args = c.Meta.process(args)
-	envCommandShowWarning(c.Ui, c.LegacyName)
-
-	var force bool
-	var stateLock bool
-	var stateLockTimeout time.Duration
-	cmdFlags := c.Meta.defaultFlagSet("workspace delete")
-	cmdFlags.BoolVar(&force, "force", false, "force removal of a non-empty workspace")
-	cmdFlags.BoolVar(&stateLock, "lock", true, "lock state")
-	cmdFlags.DurationVar(&stateLockTimeout, "lock-timeout", 0, "lock timeout")
-	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
-		return 1
-	}
-
-	args = cmdFlags.Args()
-	if len(args) != 1 {
-		c.Ui.Error("Expected a single argument: NAME.\n")
-		return cli.RunResultHelp
-	}
-
-	configPath, err := ModulePath(args[1:])
-	if err != nil {
-		c.Ui.Error(err.Error())
-		return 1
-	}
-
+func (c *WorkspaceDeleteCommand) Run(rawArgs []string) int {
 	var diags tfdiags.Diagnostics
+	diags = diags.Append(envCommandWarningDiag(c.LegacyName))
 
-	backendConfig, backendDiags := c.loadBackendConfig(configPath)
-	diags = diags.Append(backendDiags)
+	// Parse and apply global view arguments
+	common, rawArgs := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
+
+	// Process command-specific arguments.
+	args, argDiags := arguments.ParseWorkspaceDelete(rawArgs)
+	diags = diags.Append(argDiags)
+
+	// Prepare the view
+	view := views.NewWorkspaceDelete(args.ViewType, c.View)
+
+	// Now the view is ready, process any error diagnostics from parsing arguments.
 	if diags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// Load the backend
-	b, backendDiags := c.Backend(&BackendOpts{
-		Config: backendConfig,
-	})
+	configPath := c.WorkingDir.RootModuleDir()
+	b, backendDiags := c.backend(configPath, args.ViewType)
 	diags = diags.Append(backendDiags)
 	if backendDiags.HasErrors() {
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	// This command will not write state
 	c.ignoreRemoteVersionConflict(b)
 
-	workspaces, err := b.Workspaces()
-	if err != nil {
-		c.Ui.Error(err.Error())
+	workspaces, wDiags := b.Workspaces()
+	diags = diags.Append(wDiags)
+	if wDiags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	workspace := args[0]
+	// Is the user attempting to delete a workspace that doesn't exist?
+	workspace := args.Name
 	exists := false
 	for _, ws := range workspaces {
 		if workspace == ws {
@@ -89,32 +72,45 @@ func (c *WorkspaceDeleteCommand) Run(args []string) int {
 	}
 
 	if !exists {
-		c.Ui.Error(fmt.Sprintf(strings.TrimSpace(envDoesNotExist), workspace))
+		diags = diags.Append(fmt.Errorf(strings.TrimSpace(envDoesNotExist), workspace))
+		view.Diagnostics(diags)
 		return 1
 	}
 
+	// Is the user attempting to delete the currently selected workspace?
 	currentWorkspace, err := c.Workspace()
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error selecting workspace: %s", err))
+		diags = diags.Append(fmt.Errorf("Error selecting workspace: %s", err))
+		view.Diagnostics(diags)
 		return 1
 	}
 	if workspace == currentWorkspace {
-		c.Ui.Error(fmt.Sprintf(strings.TrimSpace(envDelCurrent), workspace))
+		diags = diags.Append(fmt.Errorf(strings.TrimSpace(envDelCurrent), workspace))
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	// we need the actual state to see if it's empty
-	stateMgr, err := b.StateMgr(workspace)
-	if err != nil {
-		c.Ui.Error(err.Error())
+	// Is the user attempting to delete the default workspace?
+	if workspace == backend.DefaultStateName {
+		diags = diags.Append(fmt.Errorf("Cannot delete the default workspace"))
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	// Check if the workspace's state is empty or not
+	stateMgr, sDiags := b.StateMgr(workspace)
+	diags = diags.Append(sDiags)
+	if sDiags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	var stateLocker clistate.Locker
-	if stateLock {
-		stateLocker = clistate.NewLocker(c.stateLockTimeout, views.NewStateLocker(arguments.ViewHuman, c.View))
-		if diags := stateLocker.Lock(stateMgr, "state-replace-provider"); diags.HasErrors() {
-			c.showDiagnostics(diags)
+	if args.Lock {
+		stateLocker = clistate.NewLocker(c.stateLockTimeout, views.NewStateLocker(args.ViewType, c.View))
+		if lDiags := stateLocker.Lock(stateMgr, "state-replace-provider"); lDiags.HasErrors() {
+			diags = diags.Append(lDiags)
+			view.Diagnostics(diags)
 			return 1
 		}
 	} else {
@@ -124,13 +120,14 @@ func (c *WorkspaceDeleteCommand) Run(args []string) int {
 	if err := stateMgr.RefreshState(); err != nil {
 		// We need to release the lock before exit
 		stateLocker.Unlock()
-		c.Ui.Error(err.Error())
+		diags = diags.Append(fmt.Errorf("Error refreshing state: %w", err))
+		view.Diagnostics(diags)
 		return 1
 	}
 
 	hasResources := stateMgr.State().HasManagedResourceInstanceObjects()
 
-	if hasResources && !force {
+	if hasResources && !args.Force {
 		// We'll collect a list of what's being managed here as extra context
 		// for the message.
 		var buf strings.Builder
@@ -153,7 +150,7 @@ func (c *WorkspaceDeleteCommand) Run(args []string) int {
 				workspace, buf.String(),
 			),
 		))
-		c.showDiagnostics(diags)
+		view.Diagnostics(diags)
 		return 1
 	}
 
@@ -168,26 +165,23 @@ func (c *WorkspaceDeleteCommand) Run(args []string) int {
 	// be delegated from the Backend to the State itself.
 	stateLocker.Unlock()
 
-	err = b.DeleteWorkspace(workspace, force)
-	if err != nil {
-		c.Ui.Error(err.Error())
+	dwDiags := b.DeleteWorkspace(workspace, args.Force)
+	diags = diags.Append(dwDiags)
+	if dwDiags.HasErrors() {
+		view.Diagnostics(diags)
 		return 1
 	}
 
-	c.Ui.Output(
-		c.Colorize().Color(
-			fmt.Sprintf(envDeleted, workspace),
-		),
-	)
-
 	if hasResources {
-		c.Ui.Output(
-			c.Colorize().Color(
-				fmt.Sprintf(envWarnNotEmpty, workspace),
-			),
-		)
+		// A user forced this deletion, but lets warn them of the consequence of the force flag.
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Warning,
+			fmt.Sprintf("Workspace %q was non-empty", workspace),
+			`The resources managed by the deleted workspace may still exist, but are no longer manageable by Terraform since the state has been deleted.`,
+		))
 	}
 
+	view.LogWorkspaceDeletionSuccess(workspace, diags)
 	return 0
 }
 
@@ -213,16 +207,21 @@ Usage: terraform [global options] workspace delete [OPTIONS] NAME
 
 Options:
 
-  -force             Remove a workspace even if it is managing resources.
-                     Terraform can no longer track or manage the workspace's
-                     infrastructure.
+  -compact-warnings    If Terraform produces any warnings that are not
+                       accompanied by errors, show them in a more compact
+                       form that includes only the summary messages
 
-  -lock=false        Don't hold a state lock during the operation. This is
-                     dangerous if others might concurrently run commands
-                     against the same workspace.
+  -force               Remove a workspace even if it is managing resources.
+                       Terraform can no longer track or manage the workspace's
+                       infrastructure.
 
-  -lock-timeout=0s   Duration to retry a state lock.
+  -lock=false          Don't hold a state lock during the operation. This is
+                       dangerous if others might concurrently run commands
+                       against the same workspace.
 
+  -lock-timeout=0s     Duration to retry a state lock.
+
+  -no-color            If specified, output won't contain any color.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -230,3 +229,10 @@ Options:
 func (c *WorkspaceDeleteCommand) Synopsis() string {
 	return "Delete a workspace"
 }
+
+const envDelCurrent = `
+Workspace %[1]q is your active workspace.
+
+You cannot delete the currently active workspace. Please switch
+to another workspace and try again.
+`

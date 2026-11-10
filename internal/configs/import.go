@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package configs
@@ -14,6 +14,8 @@ import (
 
 type Import struct {
 	ID hcl.Expression
+
+	Identity hcl.Expression
 
 	To hcl.Expression
 	// The To address may not be resolvable immediately if it contains dynamic
@@ -41,6 +43,10 @@ func decodeImportBlock(block *hcl.Block) (*Import, hcl.Diagnostics) {
 
 	if attr, exists := content.Attributes["id"]; exists {
 		imp.ID = attr.Expr
+	}
+
+	if attr, exists := content.Attributes["identity"]; exists {
+		imp.Identity = attr.Expr
 	}
 
 	if attr, exists := content.Attributes["to"]; exists {
@@ -87,6 +93,24 @@ func decodeImportBlock(block *hcl.Block) (*Import, hcl.Diagnostics) {
 		diags = append(diags, providerDiags...)
 	}
 
+	if imp.ID == nil && imp.Identity == nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid import block",
+			Detail:   "At least one of 'id' or 'identity' must be specified.",
+			Subject:  block.DefRange.Ptr(),
+		})
+	}
+
+	if imp.ID != nil && imp.Identity != nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid import block",
+			Detail:   "Only one of 'id' or 'identity' can be specified.",
+			Subject:  block.DefRange.Ptr(),
+		})
+	}
+
 	return imp, diags
 }
 
@@ -99,12 +123,14 @@ var importBlockSchema = &hcl.BodySchema{
 			Name: "for_each",
 		},
 		{
-			Name:     "id",
-			Required: true,
+			Name: "id",
 		},
 		{
 			Name:     "to",
 			Required: true,
+		},
+		{
+			Name: "identity",
 		},
 	},
 }
@@ -115,12 +141,19 @@ var importBlockSchema = &hcl.BodySchema{
 // block's "to" to the configuration address before the full instance
 // expressions are evaluated.
 func parseConfigResourceFromExpression(expr hcl.Expression) (addrs.ConfigResource, tfdiags.Diagnostics) {
-	traversal, hcdiags := exprToResourceTraversal(expr)
+	// The "to" address can use each.key and each.value in its instance keys,
+	// which aren't needed to find the configuration address, so they are
+	// treated as wildcards here.
+	addrExpr, hcdiags := addrs.ParseAddressExpr(expr)
+	if hcdiags.HasErrors() {
+		return addrs.ConfigResource{}, tfdiags.Diagnostics(nil).Append(hcdiags)
+	}
+	traversal, hcdiags := addrExpr.Traversal(nil)
 	if hcdiags.HasErrors() {
 		return addrs.ConfigResource{}, tfdiags.Diagnostics(nil).Append(hcdiags)
 	}
 
-	addr, diags := addrs.ParseAbsResourceInstance(traversal)
+	addr, diags := addrs.ParsePartialResourceInstance(traversal)
 	if diags.HasErrors() {
 		return addrs.ConfigResource{}, diags
 	}
@@ -161,47 +194,6 @@ func unwrapJSONRefExpr(expr hcl.Expression) (hcl.Expression, hcl.Diagnostics) {
 	expr, ds := hclsyntax.ParseExpression([]byte(v.AsString()), rng.Filename, rng.Start)
 	diags = diags.Extend(ds)
 	return expr, diags
-}
-
-// exprToResourceTraversal is used to parse the import block's to expression,
-// which must be a resource instance, but may contain limited variables with
-// index expressions. Since we only need the ConfigResource to connect the
-// import to the configuration, we skip any index expressions.
-func exprToResourceTraversal(expr hcl.Expression) (hcl.Traversal, hcl.Diagnostics) {
-	var trav hcl.Traversal
-	var diags hcl.Diagnostics
-
-	switch e := expr.(type) {
-	case *hclsyntax.RelativeTraversalExpr:
-		t, d := exprToResourceTraversal(e.Source)
-		diags = diags.Extend(d)
-		trav = append(trav, t...)
-		trav = append(trav, e.Traversal...)
-
-	case *hclsyntax.ScopeTraversalExpr:
-		// a static reference, we can just append the traversal
-		trav = append(trav, e.Traversal...)
-
-	case *hclsyntax.IndexExpr:
-		// Get the collection from the index expression, we don't need the
-		// index for a ConfigResource
-		t, d := exprToResourceTraversal(e.Collection)
-		diags = diags.Extend(d)
-		if diags.HasErrors() {
-			return nil, diags
-		}
-		trav = append(trav, t...)
-
-	default:
-		// if we don't recognise the expression type (which means we are likely
-		// dealing with a test mock), try and interpret this as an absolute
-		// traversal
-		t, d := hcl.AbsTraversalForExpr(e)
-		diags = diags.Extend(d)
-		trav = append(trav, t...)
-	}
-
-	return trav, diags
 }
 
 // parseImportToStatic attempts to parse the To address of an import block

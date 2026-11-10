@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package rpcapi
@@ -8,11 +8,13 @@ import (
 	"sync"
 
 	"github.com/hashicorp/go-slug/sourcebundle"
+
 	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/providercache"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
+	"github.com/hashicorp/terraform/internal/states"
 )
 
 // handle represents an identifier shared between client and server to identify
@@ -138,6 +140,19 @@ func (t *handleTable) CloseStackPlan(hnd handle[*stackplan.Plan]) error {
 	return closeHandle(t, hnd)
 }
 
+func (t *handleTable) NewTerraformState(state *states.State) handle[*states.State] {
+	return newHandle(t, state)
+}
+
+func (t *handleTable) TerraformState(hnd handle[*states.State]) *states.State {
+	ret, _ := readHandle(t, hnd) // non-existent or invalid returns nil
+	return ret
+}
+
+func (t *handleTable) CloseTerraformState(hnd handle[*states.State]) error {
+	return closeHandle(t, hnd)
+}
+
 func (t *handleTable) NewDependencyLocks(locks *depsfile.Locks) handle[*depsfile.Locks] {
 	// NOTE: We intentionally don't track a dependency on a source bundle
 	// here for two reasons:
@@ -204,6 +219,7 @@ func newHandle[ObjT any](t *handleTable, obj ObjT) handle[ObjT] {
 // returned error will be [newHandleErrorNoParent].
 func newHandleWithDependency[ObjT, DepT any](t *handleTable, obj ObjT, dep handle[DepT]) (handle[ObjT], error) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	if depObjectI, exists := t.handleObjs[int64(dep)]; !exists {
 		return handle[ObjT](0), newHandleErrorNoParent
 	} else if depObject, ok := depObjectI.(DepT); !ok {
@@ -218,7 +234,6 @@ func newHandleWithDependency[ObjT, DepT any](t *handleTable, obj ObjT, dep handl
 		t.handleDeps[int64(dep)] = make(map[int64]struct{})
 	}
 	t.handleDeps[int64(dep)][hnd] = struct{}{}
-	t.mu.Unlock()
 	return handle[ObjT](hnd), nil
 }
 

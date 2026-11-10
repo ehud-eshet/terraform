@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package collections
@@ -73,6 +73,15 @@ func (s Set[T]) Add(vs ...T) {
 	for _, v := range vs {
 		k := s.key(v)
 		s.members[k] = v
+	}
+}
+
+// AddAll inserts all the members of vs into the set.
+//
+// The behavior is the same as calling Add for each member of vs.
+func (s Set[T]) AddAll(vs Set[T]) {
+	for v := range vs.All() {
+		s.Add(v)
 	}
 }
 

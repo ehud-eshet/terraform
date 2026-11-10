@@ -1,25 +1,101 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package views
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
+	version "github.com/hashicorp/go-version"
+	tfaddr "github.com/hashicorp/terraform-registry-address"
+	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command/arguments"
+	"github.com/hashicorp/terraform/internal/command/views/json"
+	"github.com/hashicorp/terraform/internal/getproviders"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
 // The Init view is used for the init command.
 type Init interface {
+	JSONOutputVersionLogger
+
 	Diagnostics(diags tfdiags.Diagnostics)
-	Output(messageCode InitMessageCode, params ...any)
-	LogInitMessage(messageCode InitMessageCode, params ...any)
-	Log(message string, params ...any)
-	PrepareMessage(messageCode InitMessageCode, params ...any) string
+	PolicyResult(addr string, resp policy.EvaluationResponse)
+	PolicyDiagnostics(diags policy.Diagnostics)
+
+	// LogConfigurationCopyingStart describes the start of copying a module to create the root module in an empty directory.
+	LogConfigurationCopyingStart(moduleSource string)
+
+	// LogInstallStateStoreProviderStart indicates progress during installation of a state store provider.
+	// This is signposted as distinct from general provider download, which may happen later in init.
+	LogInstallStateStoreProviderStart(providerAddr addrs.Provider, cons getproviders.VersionConstraints, storeType string)
+
+	// LogInitializingStateStoreStart indicates progress during initialization of a state store.
+	LogInitializingStateStoreStart(storeType string)
+
+	// LogInitializingBackendStart indicates progress initializing a backend.
+	LogInitializingBackendStart()
+
+	// LogMigrateBackendUnsetStart indicates that the state is going to be migrated after unsetting/successfully removing from the configuration.
+	LogMigrateBackendUnsetStart(backendType string)
+
+	// LogMigrateBackendUnsetEnd indicates that the state is going to be migrated after the backend has been unset/removed from the configuration.
+	LogMigrateBackendUnsetEnd(backendType string)
+
+	// LogMigrateBackendReconfigured indicates that the backend has been reconfigured successfully.
+	LogMigrateBackendReconfigured()
+
+	// LogMigrateFromBackendToBackend indicates that the state is going to be migrated from one backend type to another.
+	LogMigrateFromBackendToBackend(oldType, newType string)
+
+	// LogMigrateFromBackendToCloud indicates that the state is going to be migrated from the backend to the cloud.
+	LogMigrateFromBackendToCloud(backendType string)
+
+	// LogMigrateFromCloudToBackend indicates that the state is going to be migrated from the cloud to the backend.
+	LogMigrateFromCloudToBackend(backendType string)
+
+	// LogMigrateFromCloudToLocal indicates that the state is going to be migrated from the cloud to a local backend.
+	LogMigrateFromCloudToLocal()
+
+	// LogMigrateCloudConfigurationChanged indicates that the backend is being migrated following a change in cloud configuration.
+	LogMigrateCloudConfigurationChanged()
+
+	// LogInitializingHCPTerraformStart indicates progress initializing the `cloud` backend.
+	LogInitializingHCPTerraformStart()
+
+	// LogModuleUpgrade describes the start of upgrading a module during init.
+	LogModuleUpgrade()
+
+	// LogModuleInitialization describes the start of initializing a module during init.
+	LogModuleInitialization()
+
+	// LogInitSuccess reports a successful init command completing
+	LogInitSuccess()
+
+	// LogInitSuccessCloud is just like LogInitSuccess but uses HCP Terraform-specific language
+	LogInitSuccessCloud()
+
+	// LogInitSuccessEmpty reports a successful init command completing, but notes that the config was empty
+	LogInitSuccessEmpty()
+
+	// LogCallToActionCLI is used when Terraform is not running in automation and prompt users about using the primary workflow
+	LogCallToActionCLI()
+
+	// LogCallToActionCLICloud is just like LogCallToActionCLI but uses HCP Terraform-specific language
+	LogCallToActionCLICloud()
+
+	// LogBackendConfiguredSuccess reports that the backend was successfully configured.
+	LogBackendConfiguredSuccess(backendType string)
+
+	ModuleInstallationLogger
+	ProviderInstallationLogger
+	ProviderLockingLogger
+
+	StateStoreProviderTrustLogger
+
+	Spacer // The `init` command logs empty lines to space-out different sections of human-readable output
 }
 
 // NewInit returns Init implementation for the given ViewType.
@@ -44,38 +120,227 @@ type InitHuman struct {
 	view *View
 }
 
-var _ Init = (*InitHuman)(nil)
+func (v *InitHuman) Version() {}
+
+var (
+	_ Init                          = (*InitHuman)(nil)
+	_ JSONOutputVersionLogger       = (*InitHuman)(nil)
+	_ Spacer                        = (*InitHuman)(nil)
+	_ ProviderInstallationLogger    = (*InitHuman)(nil)
+	_ ProviderLockingLogger         = (*InitHuman)(nil)
+	_ StateStoreProviderTrustLogger = (*InitHuman)(nil)
+	_ ModuleInstallationLogger      = (*InitHuman)(nil)
+)
 
 func (v *InitHuman) Diagnostics(diags tfdiags.Diagnostics) {
 	v.view.Diagnostics(diags)
 }
 
-func (v *InitHuman) Output(messageCode InitMessageCode, params ...any) {
-	v.view.streams.Println(v.PrepareMessage(messageCode, params...))
+func (v *InitHuman) Spacer() {
+	v.view.Spacer()
 }
 
-func (v *InitHuman) LogInitMessage(messageCode InitMessageCode, params ...any) {
-	v.view.streams.Println(v.PrepareMessage(messageCode, params...))
+func (v *InitHuman) PolicyDiagnostics(diags policy.Diagnostics) {
+	v.view.PolicyDiagnostics(diags)
 }
 
-// this implements log method for use by interfaces that need to log generic string messages, e.g used for logging in hook_module_install.go
-func (v *InitHuman) Log(message string, params ...any) {
-	v.view.streams.Println(strings.TrimSpace(fmt.Sprintf(message, params...)))
+func (v *InitHuman) PolicyResult(addr string, resp policy.EvaluationResponse) {
+	v.view.PolicyResult(addr, resp)
 }
 
-func (v *InitHuman) PrepareMessage(messageCode InitMessageCode, params ...any) string {
-	message, ok := MessageRegistry[messageCode]
-	if !ok {
-		// display the message code as fallback if not found in the message registry
-		return string(messageCode)
+func (v *InitHuman) LogConfigurationCopyingStart(moduleSource string) {
+	v.print(fmt.Sprintf("[reset][bold]Copying configuration[reset] from %q...", moduleSource))
+}
+
+func (v *InitHuman) LogInitializingBackendStart() {
+	v.print("\n[reset][bold]Initializing the backend...")
+}
+
+func (v *InitHuman) LogMigrateBackendUnsetStart(backendType string) {
+	v.print(fmt.Sprintf(`Terraform has detected you're unconfiguring your previously set %q backend.`, backendType))
+}
+
+func (v *InitHuman) LogMigrateBackendUnsetEnd(backendType string) {
+	v.print(fmt.Sprintf(`[reset][green]
+
+Successfully unset the backend %q. Terraform will now operate locally.`, backendType))
+}
+
+func (v *InitHuman) LogMigrateBackendReconfigured() {
+	v.print(`[reset][bold]Backend configuration changed![reset]
+
+Terraform has detected that the configuration specified for the backend
+has changed. Terraform will now check for existing state in the backends.
+`)
+}
+
+func (v *InitHuman) LogMigrateFromBackendToBackend(oldType, newType string) {
+	v.print(fmt.Sprintf(`[reset]Terraform detected that the backend type changed from %q to %q.`, oldType, newType))
+}
+
+func (v *InitHuman) LogMigrateFromBackendToCloud(backendType string) {
+	v.print(fmt.Sprintf("Migrating from backend %q to HCP Terraform.", backendType))
+}
+
+func (v *InitHuman) LogMigrateFromCloudToBackend(backendType string) {
+	v.print(fmt.Sprintf("Migrating from HCP Terraform to backend %q.", backendType))
+}
+
+func (v *InitHuman) LogMigrateFromCloudToLocal() {
+	v.print("Migrating from HCP Terraform or Terraform Enterprise to local state.")
+}
+
+func (v *InitHuman) LogMigrateCloudConfigurationChanged() {
+	v.print("HCP Terraform configuration has changed.")
+}
+
+func (v *InitHuman) LogInitializingHCPTerraformStart() {
+	v.print("\n[reset][bold]Initializing HCP Terraform...")
+}
+
+func (v *InitHuman) LogInitSuccess() {
+	v.print("[reset][bold][green]Terraform has been successfully initialized![reset][green]")
+}
+
+func (v *InitHuman) LogInitSuccessCloud() {
+	v.print("[reset][bold][green]HCP Terraform has been successfully initialized![reset][green]")
+}
+
+func (v *InitHuman) LogInitSuccessEmpty() {
+	v.print(strings.TrimSpace(outputInitEmpty))
+}
+
+func (v *InitHuman) LogCallToActionCLI() {
+	v.print(strings.TrimSpace(outputInitSuccessCLI))
+}
+
+func (v *InitHuman) LogCallToActionCLICloud() {
+	v.print(strings.TrimSpace(outputInitSuccessCLICloud))
+}
+
+func (v *InitHuman) LogBackendConfiguredSuccess(backendType string) {
+	v.print(fmt.Sprintf(strings.TrimSpace(backendConfiguredSuccessHuman), backendType))
+}
+
+func (v *InitHuman) LogInstallProvidersStart() {
+	v.print("\n[reset][bold]Initializing provider plugins...")
+}
+
+func (v *InitHuman) LogInstallStateStoreProviderStart(pAddr tfaddr.Provider, cons getproviders.VersionConstraints, storeType string) {
+	consSuffix := ""
+	if len(cons) > 0 {
+		consSuffix = fmt.Sprintf(" (%s)", getproviders.VersionConstraintsString(cons))
 	}
+	params := []any{pAddr.ForDisplay(), consSuffix, storeType}
+	v.print(fmt.Sprintf("[reset][bold]Installing provider %s%s for state store %q...", params...))
+}
 
-	if message.HumanValue == "" {
-		// no need to apply colorization if the message is empty
-		return message.HumanValue
+func (v *InitHuman) LogInitializingStateStoreStart(storeType string) {
+	v.print(fmt.Sprintf("\n[reset][bold]Initializing the state store %q...", storeType))
+}
+
+func (v *InitHuman) LogInteractiveApproval() {
+	v.print("[reset][bold]The state store provider was approved by the user.")
+}
+
+func (v *InitHuman) LogInteractiveRejection() {
+	v.print("[reset][bold]The state store provider was rejected by the user.")
+}
+
+func (v *InitHuman) LogAutomaticApproval() {
+	v.print("[reset][bold]The state store provider was approved automatically.")
+}
+
+func (v *InitHuman) LogFindingMatchingVersion(providerAddr addrs.Provider, versionConstraints getproviders.VersionConstraints) {
+	v.print(fmt.Sprintf("- Finding %s versions matching %q...", providerAddr.ForDisplay(), getproviders.VersionConstraintsString(versionConstraints)))
+}
+
+func (v *InitHuman) LogFindingLatestVersion(providerAddr addrs.Provider) {
+	v.print(fmt.Sprintf("- Finding latest version of %s...", providerAddr.ForDisplay()))
+}
+
+func (v *InitHuman) LogProviderVersionAlreadyInstalled(providerAddr addrs.Provider, version getproviders.Version) {
+	v.print(fmt.Sprintf("- Using previously-installed %s v%s", providerAddr.ForDisplay(), version))
+}
+
+func (v *InitHuman) LogUsingProviderVersionFromCacheDir(providerAddr addrs.Provider, version getproviders.Version) {
+	v.print(fmt.Sprintf("- Using %s v%s from the shared cache directory", providerAddr.ForDisplay(), version))
+}
+
+func (v *InitHuman) LogBuiltInProviderAvailable(providerAddr addrs.Provider) {
+	v.print(fmt.Sprintf("- %s is built in to Terraform", providerAddr.ForDisplay()))
+}
+
+func (v *InitHuman) LogInstallProviderVersionStart(providerAddr addrs.Provider, version getproviders.Version) {
+	v.print(fmt.Sprintf("- Installing %s v%s...", providerAddr.ForDisplay(), version))
+}
+
+func (v *InitHuman) LogReusingPreviousProviderVersion(providerAddr addrs.Provider, version getproviders.Version) {
+	v.print(fmt.Sprintf("- Reusing version %s of %s from the dependency lock file", version, providerAddr.ForDisplay()))
+}
+
+func (v *InitHuman) LogInstallProviderVersionComplete(providerAddr addrs.Provider, version getproviders.Version, auth *getproviders.PackageAuthenticationResult) {
+	v.print(fmt.Sprintf("- Installed %s v%s (%s%s)", providerAddr.ForDisplay(), version, auth, "")) // add empty key id to the end
+}
+
+func (v *InitHuman) LogInstallProviderVersionCompleteWithKeyID(providerAddr addrs.Provider, version getproviders.Version, auth *getproviders.PackageAuthenticationResult, keyID string) {
+	keyDetails := fmt.Sprintf(", key ID [reset][bold]%s[reset]", keyID) // key id needs to be formatted for human output
+	msg := fmt.Sprintf("- Installed %s v%s (%s%s)", providerAddr.ForDisplay(), version, auth, keyDetails)
+	v.print(msg)
+}
+
+func (v *InitHuman) LogPartnerAndCommunityProviders() {
+	v.print(logPartnerAndCommunityProviders)
+}
+
+func (v *InitHuman) LogProviderLockfileCreated() {
+	v.print(createdLockInfoHuman)
+}
+
+func (v *InitHuman) LogProviderLockfileUpdated() {
+	v.print(dependenciesLockChangesInfo)
+}
+
+// Implements ModuleInstallationLogger
+//
+// See logging in hook_module_install.go
+func (v *InitHuman) LogModuleDownload(packageAddr string, version *version.Version, modulePath string) {
+	var message string
+	if version == nil {
+		message = fmt.Sprintf("Downloading %s for %s...", packageAddr, modulePath)
+	} else {
+		message = fmt.Sprintf("Downloading %s %s for %s...", packageAddr, version, modulePath)
 	}
+	v.print(strings.TrimSpace(message))
+}
 
-	return v.view.colorize.Color(strings.TrimSpace(fmt.Sprintf(message.HumanValue, params...)))
+// Implements ModuleInstallationLogger
+//
+// See logging in hook_module_install.go
+func (v *InitHuman) LogModuleInstallation(modulePath string) {
+	v.print(fmt.Sprintf("- %s", modulePath))
+}
+
+// Implements ModuleInstallationLogger
+//
+// See logging in hook_module_install.go
+func (v *InitHuman) LogModuleInstallationWithLocalPath(modulePath, localDir string) {
+	v.print(fmt.Sprintf("- %s in %s", modulePath, localDir))
+}
+
+func (v *InitHuman) LogModuleUpgrade() {
+	v.print("[reset][bold]Upgrading modules...")
+}
+
+func (v *InitHuman) LogModuleInitialization() {
+	v.print("[reset][bold]Initializing modules...")
+}
+
+// print formats (trims whitespace & applies colour) and
+// prints the formatted message to the stdout stream.
+func (v *InitHuman) print(message string) {
+	message = v.view.colorize.Color(strings.TrimSpace(message))
+	v.view.streams.Println(message)
 }
 
 // The InitJSON implementation renders streaming JSON logs, suitable for
@@ -84,195 +349,262 @@ type InitJSON struct {
 	view *JSONView
 }
 
-var _ Init = (*InitJSON)(nil)
+var (
+	_ Init                          = (*InitJSON)(nil)
+	_ JSONOutputVersionLogger       = (*InitJSON)(nil)
+	_ Spacer                        = (*InitJSON)(nil)
+	_ ProviderInstallationLogger    = (*InitJSON)(nil)
+	_ ProviderLockingLogger         = (*InitJSON)(nil)
+	_ StateStoreProviderTrustLogger = (*InitJSON)(nil)
+	_ ModuleInstallationLogger      = (*InitJSON)(nil)
+)
+
+func (v *InitJSON) Version() {
+	v.view.Version()
+}
 
 func (v *InitJSON) Diagnostics(diags tfdiags.Diagnostics) {
 	v.view.Diagnostics(diags)
 }
 
-func (v *InitJSON) Output(messageCode InitMessageCode, params ...any) {
-	// don't add empty messages to json output
-	preppedMessage := v.PrepareMessage(messageCode, params...)
-	if preppedMessage == "" {
-		return
+func (v *InitJSON) Spacer() {
+	v.view.Spacer()
+}
+
+func (v *InitJSON) PolicyDiagnostics(diags policy.Diagnostics) {
+	v.view.PolicyDiagnostics(diags)
+}
+
+func (v *InitJSON) PolicyResult(addr string, resp policy.EvaluationResponse) {
+	v.view.PolicyResult(addr, resp)
+}
+
+func (v *InitJSON) initOutputLog(preppedMessage string, messageCode json.MessageType) {
+	// Logged data includes by default:
+	// @level as "info"
+	// @module as "terraform.ui" (See NewJSONView)
+	// @timestamp formatted in the default way
+	//
+	// In the method below we:
+	// * Set @message as the first argument value
+	// * Annotate with extra data:
+	//     "type":"init_output"
+	//     "message_code":"<value>"
+	v.view.log.Info(
+		preppedMessage,
+		"type", "init_output",
+		"message_code", string(messageCode),
+	)
+}
+
+func (v *InitJSON) LogConfigurationCopyingStart(moduleSource string) {
+	v.initOutputLog(fmt.Sprintf("Copying configuration from %q...", moduleSource), json.MessageCopyingConfigurationMessage)
+}
+
+func (v *InitJSON) LogInitializingBackendStart() {
+	v.initOutputLog("Initializing the backend...", json.MessageInitializingBackendMessage)
+}
+
+func (v *InitJSON) LogMigrateBackendUnsetStart(backendType string) {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateBackendUnsetStart not implemented")
+}
+
+func (v *InitJSON) LogMigrateBackendUnsetEnd(backendType string) {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateBackendUnsetEnd not implemented")
+}
+
+func (v *InitJSON) LogMigrateBackendReconfigured() {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateBackendReconfigured not implemented")
+}
+
+func (v *InitJSON) LogMigrateFromBackendToBackend(oldType, newType string) {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateFromBackendToBackend not implemented")
+}
+
+func (v *InitJSON) LogMigrateFromBackendToCloud(backendType string) {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateFromBackendToCloud not implemented")
+}
+
+func (v *InitJSON) LogMigrateFromCloudToBackend(backendType string) {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateFromCloudToBackend not implemented")
+}
+
+func (v *InitJSON) LogMigrateFromCloudToLocal() {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateFromCloudToLocal not implemented")
+}
+
+func (v *InitJSON) LogMigrateCloudConfigurationChanged() {
+	// `-json` and `-migrate-state` are mutually exclusive.
+	panic("InitJSON: LogMigrateCloudConfigurationChanged not implemented")
+}
+
+func (v *InitJSON) LogInitializingHCPTerraformStart() {
+	v.initOutputLog("Initializing HCP Terraform...", json.MessageInitializingTerraformCloudMessage)
+}
+
+func (v *InitJSON) LogInitSuccess() {
+	v.initOutputLog("Terraform has been successfully initialized!", json.MessageOutputInitSuccessMessage)
+}
+
+func (v *InitJSON) LogInitSuccessCloud() {
+	v.initOutputLog("HCP Terraform has been successfully initialized!", json.MessageOutputInitSuccessCloudMessage)
+}
+
+func (v *InitJSON) LogInitSuccessEmpty() {
+	v.initOutputLog(strings.TrimSpace(outputInitEmptyJSON), json.MessageOutputInitEmptyMessage)
+}
+
+func (v *InitJSON) LogCallToActionCLI() {
+	v.initOutputLog(strings.TrimSpace(outputInitSuccessCLI_JSON), json.MessageOutputInitSuccessCLIMessage)
+}
+
+func (v *InitJSON) LogCallToActionCLICloud() {
+	v.initOutputLog(strings.TrimSpace(outputInitSuccessCLICloudJSON), json.MessageOutputInitSuccessCLICloudMessage)
+}
+
+func (v *InitJSON) LogBackendConfiguredSuccess(backendType string) {
+	v.initOutputLog(fmt.Sprintf(strings.TrimSpace(backendConfiguredSuccessJSON), backendType), json.MessageBackendConfiguredSuccess)
+}
+
+func (v *InitJSON) LogInstallProvidersStart() {
+	v.initOutputLog("Initializing provider plugins...", json.MessageInitializingProviderPluginMessage)
+}
+
+func (v *InitJSON) LogInstallStateStoreProviderStart(pAddr tfaddr.Provider, cons getproviders.VersionConstraints, storeType string) {
+	consSuffix := ""
+	if len(cons) > 0 {
+		consSuffix = fmt.Sprintf(" (%s)", getproviders.VersionConstraintsString(cons))
+	}
+	params := []any{pAddr.ForDisplay(), consSuffix, storeType}
+
+	v.view.log.Info(
+		fmt.Sprintf("Installing provider %s%s for state store %q...", params...),
+		"type", json.MessageStateStoreProviderInstallationStart,
+	)
+}
+
+func (v *InitJSON) LogInitializingStateStoreStart(storeType string) {
+	v.view.log.Info(
+		fmt.Sprintf("Initializing the state store %q...", storeType),
+		"type", json.MessageStateStoreInitializationStart,
+	)
+}
+
+func (v *InitJSON) LogInteractiveApproval() {
+	v.view.log.Info(
+		"The state store provider was approved by the user.",
+		"type", json.MessageProviderInteractiveApproval,
+	)
+}
+
+func (v *InitJSON) LogInteractiveRejection() {
+	v.view.log.Info(
+		"The state store provider was rejected by the user.",
+		"type", json.MessageProviderInteractiveRejection,
+	)
+}
+
+func (v *InitJSON) LogAutomaticApproval() {
+	v.view.log.Info(
+		"The state store provider was approved automatically.",
+		"type", json.MessageProviderAutomaticApproval,
+	)
+}
+
+func (v *InitJSON) LogFindingMatchingVersion(providerAddr addrs.Provider, versionConstraints getproviders.VersionConstraints) {
+	v.view.Log(fmt.Sprintf("Finding matching versions for provider: %s, version_constraint: %q", providerAddr.ForDisplay(), getproviders.VersionConstraintsString(versionConstraints)))
+}
+
+func (v *InitJSON) LogFindingLatestVersion(providerAddr addrs.Provider) {
+	v.view.Log(fmt.Sprintf("%s: Finding latest version...", providerAddr.ForDisplay()))
+}
+
+func (v *InitJSON) LogProviderVersionAlreadyInstalled(providerAddr addrs.Provider, version getproviders.Version) {
+	v.view.Log(fmt.Sprintf("%s v%s: Using previously-installed provider version", providerAddr.ForDisplay(), version))
+}
+
+func (v *InitJSON) LogUsingProviderVersionFromCacheDir(providerAddr addrs.Provider, version getproviders.Version) {
+	v.view.Log(fmt.Sprintf("%s v%s: Using from the shared cache directory", providerAddr.ForDisplay(), version))
+}
+
+func (v *InitJSON) LogBuiltInProviderAvailable(providerAddr addrs.Provider) {
+	v.view.Log(fmt.Sprintf("%s is built in to Terraform", providerAddr.ForDisplay()))
+}
+
+func (v *InitJSON) LogInstallProviderVersionStart(providerAddr addrs.Provider, version getproviders.Version) {
+	v.view.Log(fmt.Sprintf("Installing provider version: %s v%s...", providerAddr.ForDisplay(), version))
+}
+
+func (v *InitJSON) LogReusingPreviousProviderVersion(providerAddr addrs.Provider, version getproviders.Version) {
+	v.view.Log(fmt.Sprintf("%s: Reusing version %s from the dependency lock file", providerAddr.ForDisplay(), version))
+}
+
+func (v *InitJSON) LogInstallProviderVersionComplete(providerAddr addrs.Provider, version getproviders.Version, auth *getproviders.PackageAuthenticationResult) {
+	v.view.Log(fmt.Sprintf("Installed provider version: %s v%s (%s%s)", providerAddr.ForDisplay(), version, auth, "")) // empty key id at the end
+}
+
+func (v *InitJSON) LogInstallProviderVersionCompleteWithKeyID(providerAddr addrs.Provider, version getproviders.Version, auth *getproviders.PackageAuthenticationResult, keyID string) {
+	keyDetails := fmt.Sprintf("key_id: %s", keyID) // key id needs to be formatted for JSON output
+	msg := fmt.Sprintf("Installed provider version: %s v%s (%s%s)", providerAddr.ForDisplay(), version, auth, keyDetails)
+	v.view.Log(msg)
+}
+
+func (v *InitJSON) LogPartnerAndCommunityProviders() {
+	v.view.Log(logPartnerAndCommunityProviders)
+}
+
+func (v *InitJSON) LogProviderLockfileCreated() {
+	v.initOutputLog(strings.TrimSpace(createdLockInfoJSON), json.MessageLockInfo)
+}
+
+func (v *InitJSON) LogProviderLockfileUpdated() {
+	// Uses the long version of this message due to backwards compatibility.
+	// TODO: Replace @message contents with shorter summary with no calls to action.
+	v.initOutputLog(strings.TrimSpace(dependenciesLockChangesInfo), json.MessageDependenciesLockChangesInfo)
+}
+
+// Implements ModuleInstallationLogger
+//
+// See logging in hook_module_install.go
+func (v *InitJSON) LogModuleDownload(packageAddr string, version *version.Version, modulePath string) {
+	var message string
+	if version == nil {
+		message = fmt.Sprintf("Downloading %s for %s...", packageAddr, modulePath)
+	} else {
+		message = fmt.Sprintf("Downloading %s %s for %s...", packageAddr, version, modulePath)
 	}
 
-	current_timestamp := time.Now().UTC().Format(time.RFC3339)
-	json_data := map[string]string{
-		"@level":       "info",
-		"@message":     preppedMessage,
-		"@module":      "terraform.ui",
-		"@timestamp":   current_timestamp,
-		"type":         "init_output",
-		"message_code": string(messageCode),
-	}
-
-	init_output, _ := json.Marshal(json_data)
-	v.view.view.streams.Println(string(init_output))
+	v.view.Log(message)
 }
 
-func (v *InitJSON) LogInitMessage(messageCode InitMessageCode, params ...any) {
-	preppedMessage := v.PrepareMessage(messageCode, params...)
-	if preppedMessage == "" {
-		return
-	}
-
-	v.view.Log(preppedMessage)
+// Implements ModuleInstallationLogger
+//
+// See logging in hook_module_install.go
+func (v *InitJSON) LogModuleInstallation(modulePath string) {
+	v.view.Log(fmt.Sprintf("- %s", modulePath))
 }
 
-// this implements log method for use by services that need to log generic string messages, e.g usage logging in hook_module_install.go
-func (v *InitJSON) Log(message string, params ...any) {
-	v.view.Log(strings.TrimSpace(fmt.Sprintf(message, params...)))
+// Implements ModuleInstallationLogger
+//
+// See logging in hook_module_install.go
+func (v *InitJSON) LogModuleInstallationWithLocalPath(modulePath, localDir string) {
+	v.view.Log(fmt.Sprintf("- %s in %s", modulePath, localDir))
 }
 
-func (v *InitJSON) PrepareMessage(messageCode InitMessageCode, params ...any) string {
-	message, ok := MessageRegistry[messageCode]
-	if !ok {
-		// display the message code as fallback if not found in the message registry
-		return string(messageCode)
-	}
-
-	return strings.TrimSpace(fmt.Sprintf(message.JSONValue, params...))
+func (v *InitJSON) LogModuleUpgrade() {
+	v.initOutputLog("Upgrading modules...", json.MessageUpgradingModulesMessage)
 }
 
-// InitMessage represents a message string in both json and human decorated text format.
-type InitMessage struct {
-	HumanValue string
-	JSONValue  string
+func (v *InitJSON) LogModuleInitialization() {
+	v.initOutputLog("Initializing modules...", json.MessageInitializingModulesMessage)
 }
-
-var MessageRegistry map[InitMessageCode]InitMessage = map[InitMessageCode]InitMessage{
-	"copying_configuration_message": {
-		HumanValue: "[reset][bold]Copying configuration[reset] from %q...",
-		JSONValue:  "Copying configuration from %q...",
-	},
-	"output_init_empty_message": {
-		HumanValue: outputInitEmpty,
-		JSONValue:  outputInitEmptyJSON,
-	},
-	"output_init_success_message": {
-		HumanValue: outputInitSuccess,
-		JSONValue:  outputInitSuccessJSON,
-	},
-	"output_init_success_cloud_message": {
-		HumanValue: outputInitSuccessCloud,
-		JSONValue:  outputInitSuccessCloudJSON,
-	},
-	"output_init_success_cli_message": {
-		HumanValue: outputInitSuccessCLI,
-		JSONValue:  outputInitSuccessCLI_JSON,
-	},
-	"output_init_success_cli_cloud_message": {
-		HumanValue: outputInitSuccessCLICloud,
-		JSONValue:  outputInitSuccessCLICloudJSON,
-	},
-	"upgrading_modules_message": {
-		HumanValue: "[reset][bold]Upgrading modules...",
-		JSONValue:  "Upgrading modules...",
-	},
-	"initializing_modules_message": {
-		HumanValue: "[reset][bold]Initializing modules...",
-		JSONValue:  "Initializing modules...",
-	},
-	"initializing_terraform_cloud_message": {
-		HumanValue: "\n[reset][bold]Initializing HCP Terraform...",
-		JSONValue:  "Initializing HCP Terraform...",
-	},
-	"initializing_backend_message": {
-		HumanValue: "\n[reset][bold]Initializing the backend...",
-		JSONValue:  "Initializing the backend...",
-	},
-	"initializing_provider_plugin_message": {
-		HumanValue: "\n[reset][bold]Initializing provider plugins...",
-		JSONValue:  "Initializing provider plugins...",
-	},
-	"dependencies_lock_changes_info": {
-		HumanValue: dependenciesLockChangesInfo,
-		JSONValue:  dependenciesLockChangesInfo,
-	},
-	"lock_info": {
-		HumanValue: previousLockInfoHuman,
-		JSONValue:  previousLockInfoJSON,
-	},
-	"provider_already_installed_message": {
-		HumanValue: "- Using previously-installed %s v%s",
-		JSONValue:  "%s v%s: Using previously-installed provider version",
-	},
-	"built_in_provider_available_message": {
-		HumanValue: "- %s is built in to Terraform",
-		JSONValue:  "%s is built in to Terraform",
-	},
-	"reusing_previous_version_info": {
-		HumanValue: "- Reusing previous version of %s from the dependency lock file",
-		JSONValue:  "%s: Reusing previous version from the dependency lock file",
-	},
-	"finding_matching_version_message": {
-		HumanValue: "- Finding %s versions matching %q...",
-		JSONValue:  "Finding matching versions for provider: %s, version_constraint: %q",
-	},
-	"finding_latest_version_message": {
-		HumanValue: "- Finding latest version of %s...",
-		JSONValue:  "%s: Finding latest version...",
-	},
-	"using_provider_from_cache_dir_info": {
-		HumanValue: "- Using %s v%s from the shared cache directory",
-		JSONValue:  "%s v%s: Using from the shared cache directory",
-	},
-	"installing_provider_message": {
-		HumanValue: "- Installing %s v%s...",
-		JSONValue:  "Installing provider version: %s v%s...",
-	},
-	"key_id": {
-		HumanValue: ", key ID [reset][bold]%s[reset]",
-		JSONValue:  "key_id: %s",
-	},
-	"installed_provider_version_info": {
-		HumanValue: "- Installed %s v%s (%s%s)",
-		JSONValue:  "Installed provider version: %s v%s (%s%s)",
-	},
-	"partner_and_community_providers_message": {
-		HumanValue: partnerAndCommunityProvidersInfo,
-		JSONValue:  partnerAndCommunityProvidersInfo,
-	},
-	"init_config_error": {
-		HumanValue: errInitConfigError,
-		JSONValue:  errInitConfigErrorJSON,
-	},
-	"empty_message": {
-		HumanValue: "",
-		JSONValue:  "",
-	},
-}
-
-type InitMessageCode string
-
-const (
-	CopyingConfigurationMessage         InitMessageCode = "copying_configuration_message"
-	EmptyMessage                        InitMessageCode = "empty_message"
-	OutputInitEmptyMessage              InitMessageCode = "output_init_empty_message"
-	OutputInitSuccessMessage            InitMessageCode = "output_init_success_message"
-	OutputInitSuccessCloudMessage       InitMessageCode = "output_init_success_cloud_message"
-	OutputInitSuccessCLIMessage         InitMessageCode = "output_init_success_cli_message"
-	OutputInitSuccessCLICloudMessage    InitMessageCode = "output_init_success_cli_cloud_message"
-	UpgradingModulesMessage             InitMessageCode = "upgrading_modules_message"
-	InitializingTerraformCloudMessage   InitMessageCode = "initializing_terraform_cloud_message"
-	InitializingModulesMessage          InitMessageCode = "initializing_modules_message"
-	InitializingBackendMessage          InitMessageCode = "initializing_backend_message"
-	InitializingProviderPluginMessage   InitMessageCode = "initializing_provider_plugin_message"
-	LockInfo                            InitMessageCode = "lock_info"
-	DependenciesLockChangesInfo         InitMessageCode = "dependencies_lock_changes_info"
-	ProviderAlreadyInstalledMessage     InitMessageCode = "provider_already_installed_message"
-	BuiltInProviderAvailableMessage     InitMessageCode = "built_in_provider_available_message"
-	ReusingPreviousVersionInfo          InitMessageCode = "reusing_previous_version_info"
-	FindingMatchingVersionMessage       InitMessageCode = "finding_matching_version_message"
-	FindingLatestVersionMessage         InitMessageCode = "finding_latest_version_message"
-	UsingProviderFromCacheDirInfo       InitMessageCode = "using_provider_from_cache_dir_info"
-	InstallingProviderMessage           InitMessageCode = "installing_provider_message"
-	KeyID                               InitMessageCode = "key_id"
-	InstalledProviderVersionInfo        InitMessageCode = "installed_provider_version_info"
-	PartnerAndCommunityProvidersMessage InitMessageCode = "partner_and_community_providers_message"
-	InitConfigError                     InitMessageCode = "init_config_error"
-)
 
 const outputInitEmpty = `
 [reset][bold]Terraform initialized in an empty directory![reset]
@@ -286,22 +618,6 @@ Terraform initialized in an empty directory!
 
 The directory has no Terraform configuration files. You may begin working
 with Terraform immediately by creating Terraform configuration files.
-`
-
-const outputInitSuccess = `
-[reset][bold][green]Terraform has been successfully initialized![reset][green]
-`
-
-const outputInitSuccessJSON = `
-Terraform has been successfully initialized!
-`
-
-const outputInitSuccessCloud = `
-[reset][bold][green]HCP Terraform has been successfully initialized![reset][green]
-`
-
-const outputInitSuccessCloudJSON = `
-HCP Terraform has been successfully initialized!
 `
 
 const outputInitSuccessCLI = `[reset][green]
@@ -340,39 +656,9 @@ If you ever set or change modules or Terraform Settings, run "terraform init"
 again to reinitialize your working directory.
 `
 
-const previousLockInfoHuman = `
-Terraform has created a lock file [bold].terraform.lock.hcl[reset] to record the provider
-selections it made above. Include this file in your version control repository
-so that Terraform can guarantee to make the same selections by default when
-you run "terraform init" in the future.`
+const backendConfiguredSuccessHuman = `[reset][green]
+Successfully configured the backend %q! Terraform will automatically
+use this backend unless the backend configuration changes.`
 
-const previousLockInfoJSON = `
-Terraform has created a lock file .terraform.lock.hcl to record the provider
-selections it made above. Include this file in your version control repository
-so that Terraform can guarantee to make the same selections by default when
-you run "terraform init" in the future.`
-
-const dependenciesLockChangesInfo = `
-Terraform has made some changes to the provider dependency selections recorded
-in the .terraform.lock.hcl file. Review those changes and commit them to your
-version control system if they represent changes you intended to make.`
-
-const partnerAndCommunityProvidersInfo = "\nPartner and community providers are signed by their developers.\n" +
-	"If you'd like to know more about provider signing, you can read about it here:\n" +
-	"https://www.terraform.io/docs/cli/plugins/signing.html"
-
-const errInitConfigError = `
-[reset]Terraform encountered problems during initialisation, including problems
-with the configuration, described below.
-
-The Terraform configuration must be valid before initialization so that
-Terraform can determine which modules and providers need to be installed.
-`
-
-const errInitConfigErrorJSON = `
-Terraform encountered problems during initialisation, including problems
-with the configuration, described below.
-
-The Terraform configuration must be valid before initialization so that
-Terraform can determine which modules and providers need to be installed.
-`
+const backendConfiguredSuccessJSON = `Successfully configured the backend %q! Terraform will automatically
+use this backend unless the backend configuration changes.`

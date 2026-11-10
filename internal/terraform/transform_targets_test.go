@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -37,10 +37,8 @@ func TestTargetsTransformer(t *testing.T) {
 
 	{
 		transform := &TargetsTransformer{
-			Targets: []addrs.Targetable{
-				addrs.RootModuleInstance.Resource(
-					addrs.ManagedResourceMode, "aws_instance", "me",
-				),
+			Targets: []addrs.TargetPattern{
+				mustTargetPattern("aws_instance.me"),
 			},
 		}
 		if err := transform.Transform(&g); err != nil {
@@ -102,13 +100,8 @@ func TestTargetsTransformer_downstream(t *testing.T) {
 
 	{
 		transform := &TargetsTransformer{
-			Targets: []addrs.Targetable{
-				addrs.RootModuleInstance.
-					Child("child", addrs.NoKey).
-					Child("grandchild", addrs.NoKey).
-					Resource(
-						addrs.ManagedResourceMode, "aws_instance", "foo",
-					),
+			Targets: []addrs.TargetPattern{
+				mustTargetPattern("module.child.module.grandchild.aws_instance.foo"),
 			},
 		}
 		if err := transform.Transform(&g); err != nil {
@@ -176,10 +169,8 @@ func TestTargetsTransformer_wholeModule(t *testing.T) {
 
 	{
 		transform := &TargetsTransformer{
-			Targets: []addrs.Targetable{
-				addrs.RootModule.
-					Child("child").
-					Child("grandchild"),
+			Targets: []addrs.TargetPattern{
+				mustTargetPattern("module.child.module.grandchild"),
 			},
 		}
 		if err := transform.Transform(&g); err != nil {

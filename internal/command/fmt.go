@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package command
@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -19,22 +18,19 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 
+	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/replacefile"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
-const (
-	stdinArg = "-"
-)
-
-var (
-	fmtSupportedExts = []string{
-		".tf",
-		".tfvars",
-		".tftest.hcl",
-		".tfmock.hcl",
-	}
-)
+var fmtSupportedExts = []string{
+	".tf",
+	".tfvars",
+	".tftest.hcl",
+	".tfmock.hcl",
+	".tfquery.hcl",
+}
 
 // FmtCommand is a Command implementation that rewrites Terraform config
 // files to a canonical format and style.
@@ -49,34 +45,25 @@ type FmtCommand struct {
 }
 
 func (c *FmtCommand) Run(args []string) int {
+	var diags tfdiags.Diagnostics
+
 	if c.input == nil {
 		c.input = os.Stdin
 	}
 
 	args = c.Meta.process(args)
-	cmdFlags := c.Meta.defaultFlagSet("fmt")
-	cmdFlags.BoolVar(&c.list, "list", true, "list")
-	cmdFlags.BoolVar(&c.write, "write", true, "write")
-	cmdFlags.BoolVar(&c.diff, "diff", false, "diff")
-	cmdFlags.BoolVar(&c.check, "check", false, "check")
-	cmdFlags.BoolVar(&c.recursive, "recursive", false, "recursive")
-	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
-	if err := cmdFlags.Parse(args); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
+	parsedArgs, parseDiags := arguments.ParseFmt(args)
+	diags = diags.Append(parseDiags)
+	if parseDiags.HasErrors() {
+		c.showDiagnostics(diags)
 		return 1
 	}
 
-	args = cmdFlags.Args()
-
-	var paths []string
-	if len(args) == 0 {
-		paths = []string{"."}
-	} else if args[0] == stdinArg {
-		c.list = false
-		c.write = false
-	} else {
-		paths = args
-	}
+	c.list = parsedArgs.List
+	c.write = parsedArgs.Write
+	c.diff = parsedArgs.Diff
+	c.check = parsedArgs.Check
+	c.recursive = parsedArgs.Recursive
 
 	var output io.Writer
 	list := c.list // preserve the original value of -list
@@ -90,9 +77,10 @@ func (c *FmtCommand) Run(args []string) int {
 		output = &cli.UiWriter{Ui: c.Ui}
 	}
 
-	diags := c.fmt(paths, c.input, output)
+	fileDiags := c.fmt(parsedArgs.Paths, c.input, output)
+	diags = diags.Append(fileDiags)
 	c.showDiagnostics(diags)
-	if diags.HasErrors() {
+	if fileDiags.HasErrors() {
 		return 2
 	}
 
@@ -120,7 +108,7 @@ func (c *FmtCommand) fmt(paths []string, stdin io.Reader, stdout io.Writer) tfdi
 			diags = diags.Append(fmt.Errorf("Option -write cannot be used when reading from stdin"))
 			return diags
 		}
-		fileDiags := c.processFile("<stdin>", stdin, stdout, true)
+		fileDiags := c.processFile("<stdin>", stdin, stdout)
 		diags = diags.Append(fileDiags)
 		return diags
 	}
@@ -147,7 +135,7 @@ func (c *FmtCommand) fmt(paths []string, stdin io.Reader, stdout io.Writer) tfdi
 						continue
 					}
 
-					fileDiags := c.processFile(c.normalizePath(path), f, stdout, false)
+					fileDiags := c.processFile(c.normalizePath(path), f, stdout)
 					diags = diags.Append(fileDiags)
 					f.Close()
 
@@ -169,12 +157,12 @@ func (c *FmtCommand) fmt(paths []string, stdin io.Reader, stdout io.Writer) tfdi
 	return diags
 }
 
-func (c *FmtCommand) processFile(path string, r io.Reader, w io.Writer, isStdout bool) tfdiags.Diagnostics {
+func (c *FmtCommand) processFile(path string, r io.Reader, w io.Writer) tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 
 	log.Printf("[TRACE] terraform fmt: Formatting %s", path)
 
-	src, err := ioutil.ReadAll(r)
+	src, err := io.ReadAll(r)
 	if err != nil {
 		diags = diags.Append(fmt.Errorf("Failed to read %s", path))
 		return diags
@@ -201,9 +189,9 @@ func (c *FmtCommand) processFile(path string, r io.Reader, w io.Writer, isStdout
 			fmt.Fprintln(w, path)
 		}
 		if c.write {
-			err := ioutil.WriteFile(path, result, 0644)
+			err = replacefile.NonAtomicWriteFileWithBackup(path, src, result)
 			if err != nil {
-				diags = diags.Append(fmt.Errorf("Failed to write %s", path))
+				diags = diags.Append(err)
 				return diags
 			}
 		}
@@ -232,7 +220,7 @@ func (c *FmtCommand) processDir(path string, stdout io.Writer) tfdiags.Diagnosti
 
 	log.Printf("[TRACE] terraform fmt: looking for files in %s", path)
 
-	entries, err := ioutil.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		switch {
 		case os.IsNotExist(err):
@@ -273,7 +261,7 @@ func (c *FmtCommand) processDir(path string, stdout io.Writer) tfdiags.Diagnosti
 					continue
 				}
 
-				fileDiags := c.processFile(c.normalizePath(subPath), f, stdout, false)
+				fileDiags := c.processFile(c.normalizePath(subPath), f, stdout)
 				diags = diags.Append(fileDiags)
 				f.Close()
 
@@ -551,8 +539,8 @@ func (c *FmtCommand) Help() string {
 Usage: terraform [global options] fmt [options] [target...]
 
   Rewrites all Terraform configuration files to a canonical format. All
-  configuration files (.tf), variables files (.tfvars), and testing files 
-  (.tftest.hcl) are updated. JSON files (.tf.json, .tfvars.json, or 
+  configuration files (.tf), variables files (.tfvars), and testing files
+  (.tftest.hcl) are updated. JSON files (.tf.json, .tfvars.json, or
   .tftest.json) are not modified.
 
   By default, fmt scans the current directory for configuration files. If you
@@ -590,14 +578,14 @@ func (c *FmtCommand) Synopsis() string {
 }
 
 func bytesDiff(b1, b2 []byte, path string) (data []byte, err error) {
-	f1, err := ioutil.TempFile("", "")
+	f1, err := os.CreateTemp("", "")
 	if err != nil {
 		return
 	}
 	defer os.Remove(f1.Name())
 	defer f1.Close()
 
-	f2, err := ioutil.TempFile("", "")
+	f2, err := os.CreateTemp("", "")
 	if err != nil {
 		return
 	}

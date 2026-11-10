@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: BUSL-1.1
 
 package terraform
@@ -58,7 +58,6 @@ var (
 	_ GraphNodeModulePath        = (*nodeExpandCheck)(nil)
 	_ GraphNodeDynamicExpandable = (*nodeExpandCheck)(nil)
 	_ GraphNodeReferencer        = (*nodeExpandCheck)(nil)
-	_ graphNodeExpandsInstances  = (*nodeExpandCheck)(nil)
 )
 
 // nodeExpandCheck creates child nodes that actually execute the assertions for
@@ -75,8 +74,6 @@ type nodeExpandCheck struct {
 
 	makeInstance func(addrs.AbsCheck, *configs.Check) dag.Vertex
 }
-
-func (n *nodeExpandCheck) expandsInstances() {}
 
 func (n *nodeExpandCheck) ModulePath() addrs.Module {
 	return n.addr.Module
@@ -95,7 +92,6 @@ func (n *nodeExpandCheck) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diagno
 		testAddr := addrs.ObjectInPartialExpandedModule(pem, n.addr)
 		log.Printf("[WARN] nodeExpandCheck: not yet doing placeholder-check for all %s", testAddr)
 	})
-	addRootNodeToGraph(&g)
 
 	return &g, nil
 }
